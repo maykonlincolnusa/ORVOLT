@@ -1,27 +1,56 @@
 package contract
 
 import (
-	"fmt"
 	"time"
 
 	"google.golang.org/protobuf/proto"
 
-	evsev1 "github.com/orvolt/orvolt/contracts/gen/go/orvolt/telemetry/evse/v1"
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/domain"
+	evsev1 "github.com/orvolt/orvolt/contracts/gen/go/orvolt/telemetry/evse/v1"
 )
 
-func DecodeChargingTelemetry(payload []byte) (domain.Telemetry, error) {
+// chargingStates maps the wire enum to the stable text stored in PostgreSQL.
+// The mapping is explicit so that renaming a Protobuf enum value can never
+// silently rewrite historical rows.
+var chargingStates = map[evsev1.ChargingState]string{
+	evsev1.ChargingState_CHARGING_STATE_AVAILABLE: "AVAILABLE",
+	evsev1.ChargingState_CHARGING_STATE_PREPARING: "PREPARING",
+	evsev1.ChargingState_CHARGING_STATE_CHARGING:  "CHARGING",
+	evsev1.ChargingState_CHARGING_STATE_FINISHING: "FINISHING",
+	evsev1.ChargingState_CHARGING_STATE_FAULTED:   "FAULTED",
+}
+
+var clockSyncStates = map[evsev1.ClockSync]string{
+	evsev1.ClockSync_CLOCK_SYNC_UNSPECIFIED:    domain.ClockSyncUnspecified,
+	evsev1.ClockSync_CLOCK_SYNC_SYNCHRONIZED:   domain.ClockSyncSynchronized,
+	evsev1.ClockSync_CLOCK_SYNC_UNSYNCHRONIZED: domain.ClockSyncUnsynchronized,
+}
+
+// DecodeChargingTelemetry validates a canonical telemetry event. ingestedAt is
+// supplied by the caller rather than read from the clock here so that every
+// record in one ingest batch shares a single arrival stamp and so that the
+// decision is testable.
+func DecodeChargingTelemetry(payload []byte, ingestedAt time.Time) (domain.Telemetry, error) {
 	var message evsev1.ChargingTelemetry
 	if err := proto.Unmarshal(payload, &message); err != nil {
-		return domain.Telemetry{}, fmt.Errorf("decode charging telemetry: %w", err)
+		return domain.Telemetry{}, permanent("decode charging telemetry: %v", err)
 	}
 	if message.GetStationId() == "" || message.GetConnectorId() == "" || message.GetTimestampMs() <= 0 || message.GetEdge() == nil {
-		return domain.Telemetry{}, fmt.Errorf("charging telemetry is missing required operational fields")
+		return domain.Telemetry{}, permanent("charging telemetry is missing required operational fields")
 	}
-	state := message.GetState().String()
-	if state == "CHARGING_STATE_UNSPECIFIED" {
-		return domain.Telemetry{}, fmt.Errorf("charging telemetry state is unspecified")
+	state, known := chargingStates[message.GetState()]
+	if !known {
+		return domain.Telemetry{}, permanent("charging telemetry state is unspecified or unknown")
 	}
+	edge := message.GetEdge()
+	if edge.GetEdgeId() == "" || edge.GetSiteId() == "" {
+		return domain.Telemetry{}, permanent("charging telemetry is missing edge provenance")
+	}
+	clockSync, known := clockSyncStates[edge.GetClockSync()]
+	if !known {
+		clockSync = domain.ClockSyncUnspecified
+	}
+
 	return domain.Telemetry{
 		StationID:    message.GetStationId(),
 		ConnectorID:  message.GetConnectorId(),
@@ -33,8 +62,11 @@ func DecodeChargingTelemetry(payload []byte) (domain.Telemetry, error) {
 		SOC:          message.GetSoc(),
 		TemperatureC: message.GetTemperatureC(),
 		State:        state,
-		EdgeID:       message.GetEdge().GetEdgeId(),
-		SiteID:       message.GetEdge().GetSiteId(),
-		ReceivedAt:   time.UnixMilli(message.GetEdge().GetReceivedAtMs()).UTC(),
+		EdgeID:       edge.GetEdgeId(),
+		SiteID:       edge.GetSiteId(),
+		ReceivedAt:   time.UnixMilli(edge.GetReceivedAtMs()).UTC(),
+		EdgeSequence: edge.GetSequence(),
+		ClockSync:    clockSync,
+		IngestedAt:   ingestedAt,
 	}, nil
 }

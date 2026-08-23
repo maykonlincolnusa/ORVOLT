@@ -1,0 +1,12 @@
+# Normalise line endings. The repository is authored on mixed platforms but
+# every build, container and CI runner is Linux, so LF is the only correct
+# checkout form: a CRLF shell script fails with "bad interpreter".
+* text=auto eol=lf
+
+*.sh text eol=lf
+Makefile text eol=lf
+Dockerfile text eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary

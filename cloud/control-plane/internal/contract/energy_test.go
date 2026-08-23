@@ -17,19 +17,19 @@ func TestDecodeEnergySiteObservation(t *testing.T) {
 		ObservedAtMs:  1_700_000_000_000,
 		RetrievedAtMs: 1_700_000_000_100,
 		Source: &sitev1.SourceMetadata{
-			Provider:       sitev1.EnergyProvider_SMA,
+			Provider:       sitev1.EnergyProvider_ENERGY_PROVIDER_SMA,
 			ProviderSiteId: "sma-site-77",
 			ConsentScope:   "energy.read",
 		},
 		SolarGenerationKw: &solar,
-		BatterySoc:       &batterySOC,
-		DataQuality:      sitev1.DataQuality_MEASURED,
+		BatterySoc:        &batterySOC,
+		DataQuality:       sitev1.DataQuality_DATA_QUALITY_MEASURED,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	observation, err := contract.DecodeEnergySiteObservation(payload)
+	observation, err := contract.DecodeEnergySiteObservation(payload, ingestedAt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,20 +39,31 @@ func TestDecodeEnergySiteObservation(t *testing.T) {
 	if observation.GridImportKW != nil {
 		t.Fatalf("missing provider value must remain absent: %#v", observation)
 	}
+	if !observation.IngestedAt.Equal(ingestedAt) {
+		t.Fatalf("the caller's arrival stamp must be used, got %s", observation.IngestedAt)
+	}
 }
 
 func TestDecodeEnergySiteObservationRejectsInvalidBatterySOC(t *testing.T) {
 	batterySOC := 120.0
 	payload, err := proto.Marshal(&sitev1.EnergySiteObservation{
 		SiteId: "site-1", ObservedAtMs: 1, RetrievedAtMs: 2,
-		Source: &sitev1.SourceMetadata{Provider: sitev1.EnergyProvider_SMA, ProviderSiteId: "sma-site-77", ConsentScope: "energy.read"},
+		Source: &sitev1.SourceMetadata{
+			Provider:       sitev1.EnergyProvider_ENERGY_PROVIDER_SMA,
+			ProviderSiteId: "sma-site-77",
+			ConsentScope:   "energy.read",
+		},
 		BatterySoc:  &batterySOC,
-		DataQuality: sitev1.DataQuality_MEASURED,
+		DataQuality: sitev1.DataQuality_DATA_QUALITY_MEASURED,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := contract.DecodeEnergySiteObservation(payload); err == nil {
+	_, err = contract.DecodeEnergySiteObservation(payload, ingestedAt)
+	if err == nil {
 		t.Fatal("expected invalid battery state of charge to be rejected")
+	}
+	if !contract.IsPermanent(err) {
+		t.Fatalf("a value outside its physical range can never become valid: %v", err)
 	}
 }

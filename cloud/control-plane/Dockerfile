@@ -1,20 +1,29 @@
-FROM golang:1.23-bookworm AS build
+FROM golang:1.25-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler && rm -rf /var/lib/apt/lists/*
-RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.0
+RUN go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
 ENV PATH="/go/bin:${PATH}"
 WORKDIR /src
-COPY go.mod ./
-COPY contracts/proto ./contracts/proto
-RUN mkdir -p contracts/gen/go && protoc -I contracts/proto --go_out=contracts/gen/go --go_opt=paths=source_relative contracts/proto/orvolt/telemetry/evse/v1/telemetry.proto contracts/proto/orvolt/energy/site/v1/energy_site.proto
-RUN go mod download
-COPY cloud/control-plane ./cloud/control-plane
-RUN go build -o /out/control-plane ./cloud/control-plane/cmd/control-plane
 
-FROM debian:bookworm-slim
-RUN useradd --system --uid 10001 orvolt
+# Dependencies first so that a source-only change does not re-download them.
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Bindings are generated from the canonical contracts rather than committed, so
+# a clean checkout can always be container-built.
+COPY contracts/proto ./contracts/proto
+RUN mkdir -p contracts/gen/go && protoc -I contracts/proto \
+    --go_out=contracts/gen/go --go_opt=paths=source_relative \
+    contracts/proto/orvolt/telemetry/evse/v1/telemetry.proto \
+    contracts/proto/orvolt/energy/site/v1/energy_site.proto
+
+COPY cloud ./cloud
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/control-plane ./cloud/control-plane/cmd/control-plane
+
+FROM gcr.io/distroless/static-debian12:nonroot
 WORKDIR /app
 COPY --from=build /out/control-plane /usr/local/bin/control-plane
 COPY cloud/control-plane/migrations ./migrations
 ENV MIGRATIONS_DIR=/app/migrations
-USER orvolt
+USER nonroot:nonroot
+EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/control-plane"]

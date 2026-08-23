@@ -41,6 +41,13 @@ services:
       NATS_SUBJECT: orvolt.telemetry.evse.v1
       ENERGY_NATS_SUBJECT: orvolt.energy.site.v1
       HTTP_ADDR: :8080
+      # Bounded streams: an unbounded JetStream store eventually fills the
+      # broker's disk, at which point the whole fleet stops publishing.
+      STREAM_MAX_AGE: ${STREAM_MAX_AGE:-720h}
+      STREAM_MAX_BYTES: ${STREAM_MAX_BYTES:-8589934592}
+      INGEST_BATCH_SIZE: ${INGEST_BATCH_SIZE:-256}
+      INGEST_BATCH_INTERVAL: ${INGEST_BATCH_INTERVAL:-250ms}
+      STATION_SILENCE_AFTER: ${STATION_SILENCE_AFTER:-5m}
     ports:
       - "8080:8080"
     depends_on:
@@ -48,6 +55,7 @@ services:
         condition: service_healthy
       nats:
         condition: service_started
+    restart: unless-stopped
 
   edge-agent:
     build:
@@ -61,11 +69,20 @@ services:
       NATS_SUBJECT: orvolt.telemetry.evse.v1
       EDGE_ID: edge-dev-001
       SITE_ID: site-dev-001
+      SPOOL_DIR: /var/lib/orvolt/spool
+      OBSERVABILITY_ADDR: 0.0.0.0:9090
+    ports:
+      - "9090:9090"
+    volumes:
+      # The spool is the reason a link outage does not lose readings, so it must
+      # be persistent storage rather than the container's writable layer.
+      - edge-spool:/var/lib/orvolt/spool
     depends_on:
       nats:
         condition: service_started
       mosquitto:
         condition: service_started
+    restart: unless-stopped
 
   evse-simulator:
     build:
@@ -85,3 +102,4 @@ services:
 volumes:
   nats-data:
   postgres-data:
+  edge-spool:

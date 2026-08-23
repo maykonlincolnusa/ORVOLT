@@ -1,81 +1,277 @@
+// Package ingest consumes canonical events from JetStream and persists them.
+//
+// Three properties matter more than throughput here:
+//
+//   - Streams are bounded. An unbounded stream fills the broker's disk and then
+//     the whole fleet stops being able to publish.
+//   - Undecodable payloads are parked, not retried forever. A single corrupt
+//     device must not be able to stall a durable consumer.
+//   - Messages are persisted in batches. One transaction per telemetry sample
+//     does not survive fleet scale.
 package ingest
 
 import (
 	"context"
 	"fmt"
 	"log/slog"
+	"time"
 
-	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/contract"
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/domain"
+	"github.com/orvolt/orvolt/cloud/control-plane/internal/metrics"
 )
 
-const streamName = "ORVOLT_TELEMETRY"
+const (
+	TelemetryStreamName = "ORVOLT_TELEMETRY"
+	EnergyStreamName    = "ORVOLT_ENERGY"
+)
 
-type Consumer struct {
-	jetstream nats.JetStreamContext
-	repository domain.Repository
-	subject    string
-	subscription *nats.Subscription
+// message is the slice of jetstream.Msg the runner depends on. Depending on an
+// interface instead of the concrete type keeps the batch logic unit-testable
+// without a running broker.
+type message interface {
+	Data() []byte
+	Ack() error
+	NakWithDelay(delay time.Duration) error
+	Term() error
 }
 
-func NewConsumer(connection *nats.Conn, repository domain.Repository, subject string) (*Consumer, error) {
-	if connection == nil {
-		return nil, fmt.Errorf("NATS connection is required")
+// Decoder turns a wire payload into a domain value. ingestedAt is passed in so
+// that every record in a batch shares one arrival stamp.
+type Decoder[T any] func(payload []byte, ingestedAt time.Time) (T, error)
+
+// Persister writes a decoded batch. It must be idempotent: JetStream delivery
+// is at-least-once and a redelivered batch will be written again.
+type Persister[T any] func(ctx context.Context, batch []T) error
+
+// StreamSpec describes the durable stream a runner owns.
+type StreamSpec struct {
+	Stream      string
+	Description string
+	Subject     string
+	Durable     string
+	MaxAge      time.Duration
+	MaxBytes    int64
+}
+
+// Runner consumes one subject and persists it in batches.
+type Runner[T any] struct {
+	name       string
+	consumer   jetstream.Consumer
+	decode     Decoder[T]
+	persist    Persister[T]
+	deadLetter *DeadLetter
+	batchSize  int
+	batchWait  time.Duration
+	retryDelay time.Duration
+	now        func() time.Time
+}
+
+// Service is the runner behaviour main depends on, so that runners over
+// different payload types can be supervised uniformly.
+type Service interface {
+	Name() string
+	Run(ctx context.Context) error
+}
+
+// NewRunner creates or updates the stream and its durable consumer.
+func NewRunner[T any](
+	ctx context.Context,
+	stream jetstream.JetStream,
+	spec StreamSpec,
+	decode Decoder[T],
+	persist Persister[T],
+	deadLetter *DeadLetter,
+	batchSize int,
+	batchWait time.Duration,
+) (*Runner[T], error) {
+	if spec.MaxAge <= 0 || spec.MaxBytes <= 0 {
+		return nil, fmt.Errorf("stream %s requires a positive retention age and size", spec.Stream)
 	}
-	return &Consumer{jetstream: nats.NewJetStreamContext(connection), repository: repository, subject: subject}, nil
-}
-
-func (consumer *Consumer) Start(ctx context.Context) error {
-	_, err := consumer.jetstream.AddStream(&nats.StreamConfig{
-		Name:      streamName,
-		Subjects:  []string{consumer.subject},
-		Storage:   nats.FileStorage,
-		Retention: nats.LimitsPolicy,
+	created, err := stream.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
+		Name:        spec.Stream,
+		Description: spec.Description,
+		Subjects:    []string{spec.Subject},
+		Storage:     jetstream.FileStorage,
+		Retention:   jetstream.LimitsPolicy,
+		MaxAge:      spec.MaxAge,
+		MaxBytes:    spec.MaxBytes,
+		// Drop the oldest observations rather than refusing new ones. Losing
+		// history is recoverable; a charger unable to publish is not.
+		Discard: jetstream.DiscardOld,
 	})
-	if err != nil && err != nats.ErrStreamNameAlreadyInUse {
-		return fmt.Errorf("create telemetry stream: %w", err)
-	}
-	subscription, err := consumer.jetstream.Subscribe(
-		consumer.subject,
-		func(message *nats.Msg) {
-			if err := consumer.Process(ctx, message.Data); err != nil {
-				slog.Error("telemetry processing failed; message will be redelivered", "error", err)
-				return
-			}
-			if err := message.Ack(); err != nil {
-				slog.Error("telemetry acknowledgement failed", "error", err)
-			}
-		},
-		nats.Durable("orvolt-control-plane"),
-		nats.ManualAck(),
-		nats.AckExplicit(),
-		nats.DeliverNew(),
-	)
 	if err != nil {
-		return fmt.Errorf("subscribe telemetry stream: %w", err)
+		return nil, fmt.Errorf("create stream %s: %w", spec.Stream, err)
 	}
-	consumer.subscription = subscription
-	return nil
+	consumer, err := created.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Durable:       spec.Durable,
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		MaxAckPending: 4 * batchSize,
+		AckWait:       30 * time.Second,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create consumer for %s: %w", spec.Stream, err)
+	}
+	return &Runner[T]{
+		name:       spec.Stream,
+		consumer:   consumer,
+		decode:     decode,
+		persist:    persist,
+		deadLetter: deadLetter,
+		batchSize:  batchSize,
+		batchWait:  batchWait,
+		retryDelay: 5 * time.Second,
+		now:        func() time.Time { return time.Now().UTC() },
+	}, nil
 }
 
-func (consumer *Consumer) Process(ctx context.Context, payload []byte) error {
-	telemetry, err := contract.DecodeChargingTelemetry(payload)
-	if err != nil {
-		return err
+func (runner *Runner[T]) Name() string { return runner.name }
+
+// Run consumes until the context is cancelled.
+func (runner *Runner[T]) Run(ctx context.Context) error {
+	slog.Info("ingest runner started", "stream", runner.name, "batch_size", runner.batchSize)
+	for {
+		if err := ctx.Err(); err != nil {
+			slog.Info("ingest runner stopped", "stream", runner.name)
+			return err
+		}
+		batch, err := runner.consumer.Fetch(runner.batchSize, jetstream.FetchMaxWait(runner.batchWait))
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			slog.Warn("JetStream fetch failed; retrying", "stream", runner.name, "error", err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(runner.retryDelay):
+			}
+			continue
+		}
+		messages := make([]message, 0, runner.batchSize)
+		for received := range batch.Messages() {
+			messages = append(messages, received)
+		}
+		if err := batch.Error(); err != nil {
+			slog.Warn("JetStream batch ended with an error", "stream", runner.name, "error", err)
+		}
+		if len(messages) == 0 {
+			continue
+		}
+		runner.ProcessBatch(ctx, messages)
 	}
-	if err := consumer.repository.PersistTelemetry(ctx, telemetry); err != nil {
-		return fmt.Errorf("persist charging telemetry: %w", err)
-	}
-	slog.Info("persisted charging telemetry", "station_id", telemetry.StationID, "connector_id", telemetry.ConnectorID)
-	return nil
 }
 
-func (consumer *Consumer) Stop() {
-	if consumer.subscription != nil {
-		if err := consumer.subscription.Drain(); err != nil {
-			slog.Warn("JetStream subscription drain failed", "error", err)
+// ProcessBatch decodes, persists and acknowledges one batch. It is exported so
+// that the batching policy can be tested directly.
+func (runner *Runner[T]) ProcessBatch(ctx context.Context, messages []message) {
+	ingestedAt := runner.now()
+	decoded := make([]T, 0, len(messages))
+	accepted := make([]message, 0, len(messages))
+
+	for _, received := range messages {
+		value, err := runner.decode(received.Data(), ingestedAt)
+		if err == nil {
+			decoded = append(decoded, value)
+			accepted = append(accepted, received)
+			continue
+		}
+		if contract.IsPermanent(err) {
+			runner.park(ctx, received, err)
+			continue
+		}
+		// A transient decode failure is unexpected, but redelivery is the safe
+		// interpretation: never discard an observation we merely failed to read.
+		slog.Warn("transient decode failure; message will be redelivered", "stream", runner.name, "error", err)
+		_ = received.NakWithDelay(runner.retryDelay)
+		metrics.Messages.WithLabelValues(runner.name, metrics.ResultRetried).Inc()
+	}
+
+	if len(decoded) == 0 {
+		return
+	}
+
+	started := time.Now()
+	if err := runner.persist(ctx, decoded); err != nil {
+		slog.Error("persisting batch failed; messages will be redelivered",
+			"stream", runner.name, "messages", len(accepted), "error", err)
+		for _, received := range accepted {
+			_ = received.NakWithDelay(runner.retryDelay)
+		}
+		metrics.Messages.WithLabelValues(runner.name, metrics.ResultRetried).Add(float64(len(accepted)))
+		return
+	}
+
+	metrics.PersistDuration.WithLabelValues(runner.name).Observe(time.Since(started).Seconds())
+	metrics.BatchSize.WithLabelValues(runner.name).Observe(float64(len(decoded)))
+	metrics.Messages.WithLabelValues(runner.name, metrics.ResultPersisted).Add(float64(len(decoded)))
+
+	for _, received := range accepted {
+		if err := received.Ack(); err != nil {
+			slog.Error("acknowledgement failed", "stream", runner.name, "error", err)
 		}
 	}
+	slog.Info("persisted batch", "stream", runner.name, "messages", len(decoded))
+}
+
+// park routes a permanently invalid payload to the dead-letter stream. If
+// parking itself fails the message is redelivered rather than dropped, because
+// losing the evidence is worse than processing it twice.
+func (runner *Runner[T]) park(ctx context.Context, received message, reason error) {
+	if runner.deadLetter != nil {
+		if err := runner.deadLetter.Park(ctx, runner.name, received.Data(), reason); err != nil {
+			slog.Error("dead-letter park failed; message will be redelivered", "stream", runner.name, "error", err)
+			_ = received.NakWithDelay(runner.retryDelay)
+			metrics.Messages.WithLabelValues(runner.name, metrics.ResultRetried).Inc()
+			return
+		}
+	} else {
+		slog.Warn("no dead-letter stream configured; discarding invalid payload",
+			"stream", runner.name, "reason", reason.Error())
+	}
+	_ = received.Term()
+	metrics.Messages.WithLabelValues(runner.name, metrics.ResultDeadLettered).Inc()
+}
+
+// NewTelemetryRunner wires the charging-telemetry stream to the repository.
+func NewTelemetryRunner(
+	ctx context.Context,
+	stream jetstream.JetStream,
+	repository domain.Repository,
+	subject string,
+	deadLetter *DeadLetter,
+	maxAge time.Duration,
+	maxBytes int64,
+	batchSize int,
+	batchWait time.Duration,
+) (*Runner[domain.Telemetry], error) {
+	return NewRunner(
+		ctx,
+		stream,
+		StreamSpec{
+			Stream:      TelemetryStreamName,
+			Description: "Canonical EVSE charging telemetry produced by site edge agents.",
+			Subject:     subject,
+			Durable:     "orvolt-control-plane",
+			MaxAge:      maxAge,
+			MaxBytes:    maxBytes,
+		},
+		func(payload []byte, ingestedAt time.Time) (domain.Telemetry, error) {
+			telemetry, err := contract.DecodeChargingTelemetry(payload, ingestedAt)
+			if err != nil {
+				return domain.Telemetry{}, err
+			}
+			if telemetry.ClockSync != domain.ClockSyncSynchronized {
+				metrics.UnsynchronizedClock.Inc()
+			}
+			return telemetry, nil
+		},
+		repository.PersistTelemetryBatch,
+		deadLetter,
+		batchSize,
+		batchWait,
+	)
 }

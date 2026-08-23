@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-
 )
 
 func Migrate(ctx context.Context, pool *Postgres, directory string) error {

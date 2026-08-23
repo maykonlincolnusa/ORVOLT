@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  contracts:
+    name: Contracts (buf)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ github.token }}
+      - name: Lint
+        run: buf lint
+      - name: Format check
+        run: buf format --diff --exit-code
+      - name: Breaking change detection
+        if: github.event_name == 'pull_request'
+        run: buf breaking --against '.git#branch=main'
+
+  go:
+    name: Cloud (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ github.token }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Generate bindings
+        run: buf generate
+      - name: Verify go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - name: Format check
+        run: |
+          unformatted=$(gofmt -l cloud/)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  rust:
+    name: Edge (Rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: edge/orvolt-edge-agent
+      - name: Format check
+        run: cargo fmt --manifest-path edge/orvolt-edge-agent/Cargo.toml --check
+      - name: Clippy
+        run: cargo clippy --manifest-path edge/orvolt-edge-agent/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --manifest-path edge/orvolt-edge-agent/Cargo.toml --locked
+
+  cpp:
+    name: Simulator (C++)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S simulator/evse-simulator -B build/evse-simulator -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build/evse-simulator --parallel
+      - name: Test
+        run: ctest --test-dir build/evse-simulator --output-on-failure
+
+  e2e:
+    name: End-to-end (Compose)
+    runs-on: ubuntu-latest
+    needs: [go, rust, cpp]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the stack
+        run: docker compose up -d --build
+      - name: Wait for the control plane to become ready
+        run: ./scripts/wait-for-ready.sh http://localhost:8080/ready 180
+      - name: Assert telemetry reaches PostgreSQL
+        run: ./scripts/smoke-test.sh http://localhost:8080 orvolt-sim-001 120
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --no-color --tail 200
+      - name: Tear down
+        if: always()
+        run: docker compose down --remove-orphans --volumes

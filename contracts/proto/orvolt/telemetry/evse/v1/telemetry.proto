@@ -25,13 +25,29 @@ message EdgeMetadata {
   string edge_id = 1;
   string site_id = 2;
   int64 received_at_ms = 3;
+
+  // Monotonic counter assigned by the edge agent, restarting at 1 on each
+  // process start. Consumers use it to detect gaps and to order observations
+  // that share a wall-clock millisecond.
+  uint64 sequence = 4;
+
+  // Whether the edge agent believes its wall clock is trustworthy. Chargers
+  // routinely boot without a battery-backed RTC and before NTP converges, so
+  // timestamp_ms must not be trusted when this is not SYNCHRONIZED.
+  ClockSync clock_sync = 5;
 }
 
 enum ChargingState {
   CHARGING_STATE_UNSPECIFIED = 0;
-  AVAILABLE = 1;
-  PREPARING = 2;
-  CHARGING = 3;
-  FINISHING = 4;
-  FAULTED = 5;
+  CHARGING_STATE_AVAILABLE = 1;
+  CHARGING_STATE_PREPARING = 2;
+  CHARGING_STATE_CHARGING = 3;
+  CHARGING_STATE_FINISHING = 4;
+  CHARGING_STATE_FAULTED = 5;
+}
+
+enum ClockSync {
+  CLOCK_SYNC_UNSPECIFIED = 0;
+  CLOCK_SYNC_SYNCHRONIZED = 1;
+  CLOCK_SYNC_UNSYNCHRONIZED = 2;
 }

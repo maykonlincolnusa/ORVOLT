@@ -1,18 +1,25 @@
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::Context as _;
 use async_nats::jetstream;
 use clap::Parser;
-use orvolt_edge_agent::{encode, normalize, parse_payload};
+use orvolt_edge_agent::clock::{self, ClockTrust, Sequence};
+use orvolt_edge_agent::observability::{self, Metrics};
+use orvolt_edge_agent::pipeline::{Forwarder, SinkError, TelemetrySink};
+use orvolt_edge_agent::spool::{Spool, SpoolConfig};
+use orvolt_edge_agent::{encode, normalize, parse_payload, EdgeContext};
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
-use tokio::time::sleep;
+use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "orvolt-edge-agent",
-    about = "ORVOLT MQTT to NATS telemetry bridge"
+    about = "ORVOLT site edge agent: validates local EVSE telemetry and guarantees its delivery"
 )]
 struct Config {
     #[arg(long, env = "MQTT_HOST", default_value = "localhost")]
@@ -29,46 +36,134 @@ struct Config {
     nats_url: String,
     #[arg(long, env = "NATS_SUBJECT", default_value = "orvolt.telemetry.evse.v1")]
     nats_subject: String,
+    /// NATS credentials file holding this device's JWT and seed. Without it the
+    /// agent connects anonymously, which is only acceptable on an isolated
+    /// development network.
+    #[arg(long, env = "NATS_CREDENTIALS")]
+    nats_credentials: Option<PathBuf>,
     #[arg(long, env = "EDGE_ID", default_value = "edge-dev-001")]
     edge_id: String,
     #[arg(long, env = "SITE_ID", default_value = "site-dev-001")]
     site_id: String,
+
+    /// Where undelivered telemetry is buffered. On a real charger this must be
+    /// on persistent storage that survives a power cut.
+    #[arg(long, env = "SPOOL_DIR", default_value = "spool")]
+    spool_dir: PathBuf,
+    #[arg(long, env = "SPOOL_SEGMENT_BYTES", default_value_t = 4 * 1024 * 1024)]
+    spool_segment_bytes: u64,
+    #[arg(long, env = "SPOOL_MAX_BYTES", default_value_t = 256 * 1024 * 1024)]
+    spool_max_bytes: u64,
+
+    /// Records published per round trip to the event bus.
+    #[arg(long, env = "PUBLISH_BATCH_SIZE", default_value_t = 64)]
+    publish_batch_size: usize,
+    #[arg(long, env = "FLUSH_INTERVAL_MS", default_value_t = 500)]
+    flush_interval_ms: u64,
+
+    #[arg(long, env = "OBSERVABILITY_ADDR", default_value = "0.0.0.0:9090")]
+    observability_addr: String,
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
+/// Publishes canonical telemetry to JetStream.
+///
+/// Publishes are pipelined: every record in a batch is sent before any
+/// acknowledgement is awaited. Awaiting each acknowledgement in turn, as the
+/// first version did, costs one network round trip per sample and collapses on
+/// a high-latency site link.
+struct NatsSink {
+    url: String,
+    credentials: Option<PathBuf>,
+    subject: String,
+    context: Option<jetstream::Context>,
+    metrics: Arc<Metrics>,
 }
 
-async fn connect_nats(url: &str) -> jetstream::Context {
-    loop {
-        match async_nats::connect(url).await {
+impl NatsSink {
+    fn new(
+        url: String,
+        credentials: Option<PathBuf>,
+        subject: String,
+        metrics: Arc<Metrics>,
+    ) -> Self {
+        Self {
+            url,
+            credentials,
+            subject,
+            context: None,
+            metrics,
+        }
+    }
+
+    /// Attempts to establish the connection. Failure is normal and is reported
+    /// to the caller as "still offline" rather than as a fatal error.
+    async fn connect(&mut self) -> bool {
+        if self.context.is_some() {
+            return true;
+        }
+        let connection = match &self.credentials {
+            Some(path) => async_nats::ConnectOptions::with_credentials_file(path.clone())
+                .await
+                .map(|options| options.name("orvolt-edge-agent")),
+            None => Ok(async_nats::ConnectOptions::new().name("orvolt-edge-agent")),
+        };
+        let options = match connection {
+            Ok(options) => options,
+            Err(error) => {
+                warn!(%error, "NATS credentials could not be loaded");
+                return false;
+            }
+        };
+        match options.connect(&self.url).await {
             Ok(client) => {
-                info!(nats_url = url, "connected to NATS");
-                return jetstream::new(client);
+                info!(url = %self.url, authenticated = self.credentials.is_some(), "connected to NATS");
+                self.context = Some(jetstream::new(client));
+                self.metrics.bus_connected.store(true, Ordering::Relaxed);
+                true
             }
             Err(error) => {
-                warn!(%error, nats_url = url, "NATS unavailable; retrying");
-                sleep(Duration::from_secs(2)).await;
+                warn!(%error, url = %self.url, "NATS unavailable; telemetry stays spooled");
+                self.metrics.bus_connected.store(false, Ordering::Relaxed);
+                false
             }
         }
     }
+
+    fn mark_offline(&mut self) {
+        self.context = None;
+        self.metrics.bus_connected.store(false, Ordering::Relaxed);
+    }
 }
 
-async fn publish(
-    stream: &jetstream::Context,
-    subject: &str,
-    payload: Vec<u8>,
-) -> anyhow::Result<()> {
-    stream
-        .publish(subject.to_owned(), payload.into())
-        .await
-        .context("publishing telemetry to JetStream")?
-        .await
-        .context("waiting for JetStream publish acknowledgement")?;
-    Ok(())
+impl TelemetrySink for NatsSink {
+    async fn publish(&mut self, payloads: &[Vec<u8>]) -> Result<(), SinkError> {
+        let Some(context) = self.context.clone() else {
+            return Err(SinkError::new("not connected to the event bus"));
+        };
+
+        let mut acknowledgements = Vec::with_capacity(payloads.len());
+        for payload in payloads {
+            match context
+                .publish(self.subject.clone(), payload.clone().into())
+                .await
+            {
+                Ok(acknowledgement) => acknowledgements.push(acknowledgement),
+                Err(error) => {
+                    self.mark_offline();
+                    Metrics::increment(&self.metrics.publish_failures);
+                    return Err(SinkError::new(error.to_string()));
+                }
+            }
+        }
+        for acknowledgement in acknowledgements {
+            if let Err(error) = acknowledgement.await {
+                self.mark_offline();
+                Metrics::increment(&self.metrics.publish_failures);
+                return Err(SinkError::new(error.to_string()));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -77,8 +172,38 @@ async fn main() -> anyhow::Result<()> {
         .json()
         .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::INFO.into()))
         .init();
+
     let config = Config::parse();
-    let mut stream = connect_nats(&config.nats_url).await;
+    let metrics = Arc::new(Metrics::default());
+    let sequence = Sequence::new();
+
+    let spool = Spool::open(
+        &config.spool_dir,
+        SpoolConfig {
+            segment_bytes: config.spool_segment_bytes,
+            max_total_bytes: config.spool_max_bytes,
+        },
+    )
+    .with_context(|| format!("opening the telemetry spool at {:?}", config.spool_dir))?;
+    info!(directory = ?config.spool_dir, "telemetry spool ready");
+
+    let sink = NatsSink::new(
+        config.nats_url.clone(),
+        config.nats_credentials.clone(),
+        config.nats_subject.clone(),
+        Arc::clone(&metrics),
+    );
+    let mut forwarder = Forwarder::new(spool, sink, config.publish_batch_size);
+    // Connect eagerly so a healthy site starts delivering immediately, but do
+    // not treat a failure as fatal: telemetry spools until the link returns.
+    forwarder.sink_mut().connect().await;
+
+    tokio::spawn(observability::serve(
+        config.observability_addr.clone(),
+        Arc::clone(&metrics),
+    ));
+
+    let mut flush = interval(Duration::from_millis(config.flush_interval_ms.max(50)));
 
     loop {
         let mut mqtt_options =
@@ -96,36 +221,34 @@ async fn main() -> anyhow::Result<()> {
             tokio::select! {
                 signal = tokio::signal::ctrl_c() => {
                     signal.context("waiting for shutdown signal")?;
-                    info!("edge agent shutting down");
+                    info!("edge agent shutting down; flushing spool");
+                    drain(&mut forwarder, &metrics).await;
                     return Ok(());
                 }
+                _ = flush.tick() => {
+                    drain(&mut forwarder, &metrics).await;
+                }
                 event = event_loop.poll() => match event {
+                    Ok(Event::Incoming(Incoming::ConnAck(_))) => {
+                        metrics.broker_connected.store(true, Ordering::Relaxed);
+                    }
                     Ok(Event::Incoming(Incoming::Publish(message))) => {
-                        let raw = match parse_payload(&message.payload) {
-                            Ok(raw) => raw,
-                            Err(error) => {
-                                warn!(%error, bytes = message.payload.len(), "rejected malformed MQTT telemetry");
-                                continue;
+                        Metrics::increment(&metrics.received);
+                        if let Some(payload) = accept(&message.payload, &config, &sequence, &metrics) {
+                            // Enqueuing only touches local storage, so a cloud
+                            // outage can never cause a reading to be lost here.
+                            if let Err(error) = forwarder.enqueue(&payload) {
+                                error!(%error, "spooling telemetry failed");
                             }
-                        };
-                        let telemetry = match normalize(raw, &config.edge_id, &config.site_id, now_ms()) {
-                            Ok(telemetry) => telemetry,
-                            Err(error) => {
-                                warn!(%error, "rejected invalid MQTT telemetry");
-                                continue;
-                            }
-                        };
-                        let station_id = telemetry.station_id.clone();
-                        if let Err(error) = publish(&stream, &config.nats_subject, encode(&telemetry)).await {
-                            warn!(%error, "NATS publish failed; reconnecting before continuing");
-                            stream = connect_nats(&config.nats_url).await;
-                            continue;
                         }
-                        info!(station_id = %station_id, subject = %config.nats_subject, "published normalized telemetry");
                     }
                     Ok(_) => {}
                     Err(error) => {
+                        metrics.broker_connected.store(false, Ordering::Relaxed);
                         error!(%error, "MQTT connection failed; recreating client");
+                        // Keep draining while the broker is down: the two links
+                        // fail independently.
+                        drain(&mut forwarder, &metrics).await;
                         sleep(Duration::from_secs(2)).await;
                         break;
                     }
@@ -133,4 +256,72 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Validates one broker payload and returns the encoded canonical event.
+fn accept(
+    payload: &[u8],
+    config: &Config,
+    sequence: &Sequence,
+    metrics: &Arc<Metrics>,
+) -> Option<Vec<u8>> {
+    let raw = match parse_payload(payload) {
+        Ok(raw) => raw,
+        Err(error) => {
+            Metrics::increment(&metrics.rejected);
+            warn!(%error, bytes = payload.len(), "rejected malformed MQTT telemetry");
+            return None;
+        }
+    };
+
+    let received_at_ms = clock::now_ms();
+    let trust = clock::assess(received_at_ms);
+    if trust == ClockTrust::Unsynchronized {
+        Metrics::increment(&metrics.unsynchronized_clock);
+    }
+
+    let context = EdgeContext {
+        edge_id: &config.edge_id,
+        site_id: &config.site_id,
+        received_at_ms,
+        sequence: sequence.next(),
+        clock: trust,
+    };
+    match normalize(raw, context) {
+        Ok(telemetry) => Some(encode(&telemetry)),
+        Err(error) => {
+            Metrics::increment(&metrics.rejected);
+            warn!(%error, "rejected invalid MQTT telemetry");
+            None
+        }
+    }
+}
+
+/// Publishes whatever the spool holds, reconnecting first if necessary.
+async fn drain(forwarder: &mut Forwarder<NatsSink>, metrics: &Arc<Metrics>) {
+    match forwarder.drain().await {
+        Ok(outcome) => {
+            if outcome.published > 0 {
+                Metrics::add(&metrics.published, outcome.published as u64);
+                info!(published = outcome.published, "delivered spooled telemetry");
+            }
+            if outcome.blocked {
+                // The sink refused. Reconnecting is the only recovery, and the
+                // records stay on disk until it succeeds.
+                forwarder.sink_mut().connect().await;
+            }
+        }
+        Err(error) => error!(%error, "draining the spool failed"),
+    }
+
+    let spool = forwarder.spool();
+    metrics
+        .spool_pending_bytes
+        .store(spool.pending_bytes(), Ordering::Relaxed);
+    metrics
+        .spool_dropped
+        .store(spool.dropped_records(), Ordering::Relaxed);
+    metrics
+        .spool_corrupt
+        .store(spool.corrupt_records(), Ordering::Relaxed);
 }

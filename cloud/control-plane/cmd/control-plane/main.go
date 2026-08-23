@@ -7,106 +7,160 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/config"
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/httpapi"
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/ingest"
+	"github.com/orvolt/orvolt/cloud/control-plane/internal/metrics"
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/store"
+	"github.com/orvolt/orvolt/cloud/shared/bus"
 )
 
+// deadLetterRetention is deliberately shorter than the live streams. The
+// dead-letter stream is an investigation buffer, not an archive.
+const deadLetterRetention = 7 * 24 * time.Hour
+
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	slog.SetDefault(logger)
-	config := config.Load()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	if err := run(); err != nil && !errors.Is(err, context.Canceled) {
+		slog.Error("control plane exited with an error", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	settings := config.Load()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	database, err := store.Open(ctx, config.PostgresDSN)
+	database, err := store.Open(ctx, settings.PostgresDSN)
 	if err != nil {
-		logger.Error("database connection failed", "error", err)
-		os.Exit(1)
+		return err
 	}
 	defer database.Close()
-	if err := store.Migrate(ctx, database, config.MigrationsDir); err != nil {
-		logger.Error("database migration failed", "error", err)
-		os.Exit(1)
+	if err := store.Migrate(ctx, database, settings.MigrationsDir); err != nil {
+		return err
 	}
 
-	nc, err := connectNATS(ctx, config.NATSURL)
-	if err != nil {
-		logger.Error("NATS connection failed", "error", err)
-		os.Exit(1)
-	}
-	defer nc.Drain()
-
-	consumer, err := ingest.NewConsumer(nc, database, config.NATSSubject)
-	if err != nil {
-		logger.Error("JetStream setup failed", "error", err)
-		os.Exit(1)
-	}
-	if err := consumer.Start(ctx); err != nil {
-		logger.Error("JetStream consumer failed to start", "error", err)
-		os.Exit(1)
-	}
-	energyConsumer, err := ingest.NewEnergyConsumer(nc, database, config.EnergySubject)
-	if err != nil {
-		logger.Error("energy JetStream setup failed", "error", err)
-		os.Exit(1)
-	}
-	if err := energyConsumer.Start(ctx); err != nil {
-		logger.Error("energy JetStream consumer failed to start", "error", err)
-		os.Exit(1)
-	}
-
-	api := httpapi.New(database, func(requestContext context.Context) error {
-		if err := database.Ping(requestContext); err != nil {
-			return err
-		}
-		if nc.Status() != nats.CONNECTED {
-			return errors.New("NATS is not connected")
-		}
-		return nil
+	connection, err := bus.Connect(ctx, bus.Options{
+		URL:             settings.NATSURL,
+		CredentialsFile: settings.NATSCredentials,
+		CAFile:          settings.NATSCAFile,
+		Name:            "orvolt-control-plane",
 	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = connection.Drain() }()
+
+	stream, err := jetstream.New(connection)
+	if err != nil {
+		return err
+	}
+
+	deadLetter, err := ingest.NewDeadLetter(ctx, stream, settings.DLQSubject, deadLetterRetention)
+	if err != nil {
+		return err
+	}
+
+	telemetry, err := ingest.NewTelemetryRunner(ctx, stream, database, settings.TelemetrySubject,
+		deadLetter, settings.StreamMaxAge, settings.StreamMaxBytes, settings.BatchSize, settings.BatchInterval)
+	if err != nil {
+		return err
+	}
+	energy, err := ingest.NewEnergyRunner(ctx, stream, database, settings.EnergySubject,
+		deadLetter, settings.StreamMaxAge, settings.StreamMaxBytes, settings.BatchSize, settings.BatchInterval)
+	if err != nil {
+		return err
+	}
+
+	api := httpapi.New(database, readiness(database, connection), settings.StationSilenceAfter)
 	server := &http.Server{
-		Addr:              config.HTTPAddr,
+		Addr:              settings.HTTPAddr,
 		Handler:           api.Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
+	var waitGroup sync.WaitGroup
+	for _, service := range []ingest.Service{telemetry, energy} {
+		waitGroup.Add(1)
+		go func(service ingest.Service) {
+			defer waitGroup.Done()
+			if err := service.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Error("ingest runner failed", "stream", service.Name(), "error", err)
+				stop()
+			}
+		}(service)
+	}
+
+	waitGroup.Add(1)
 	go func() {
-		logger.Info("control plane listening", "address", config.HTTPAddr)
+		defer waitGroup.Done()
+		watchSilentStations(ctx, database, settings.StationSilenceAfter)
+	}()
+
+	waitGroup.Add(1)
+	go func() {
+		defer waitGroup.Done()
+		slog.Info("control plane listening", "address", settings.HTTPAddr)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Error("HTTP server failed", "error", err)
+			slog.Error("HTTP server failed", "error", err)
 			stop()
 		}
 	}()
 
 	<-ctx.Done()
-	shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	slog.Info("shutdown requested; draining")
+
+	shutdownContext, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	consumer.Stop()
-	energyConsumer.Stop()
 	if err := server.Shutdown(shutdownContext); err != nil {
-		logger.Error("HTTP shutdown failed", "error", err)
+		slog.Error("HTTP shutdown failed", "error", err)
+	}
+	waitGroup.Wait()
+	slog.Info("control plane stopped")
+	return nil
+}
+
+func readiness(database *store.Postgres, connection *nats.Conn) func(context.Context) error {
+	return func(ctx context.Context) error {
+		if err := database.Ping(ctx); err != nil {
+			return errors.New("PostgreSQL is unreachable")
+		}
+		if connection.Status() != nats.CONNECTED {
+			return errors.New("NATS is not connected")
+		}
+		return nil
 	}
 }
 
-func connectNATS(ctx context.Context, url string) (*nats.Conn, error) {
+// watchSilentStations keeps the silent-station gauge current without waiting
+// for somebody to call the API. Alerting on chargers that went dark only works
+// if the number is published continuously.
+func watchSilentStations(ctx context.Context, database *store.Postgres, threshold time.Duration) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
 	for {
-		connection, err := nats.Connect(url, nats.Name("orvolt-control-plane"), nats.MaxReconnects(-1))
-		if err == nil {
-			return connection, nil
-		}
-		slog.Warn("NATS unavailable; retrying", "error", err, "url", url)
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(2 * time.Second):
+			return
+		case <-ticker.C:
+			silent, err := database.ListSilentStations(ctx, threshold)
+			if err != nil {
+				slog.Warn("silent-station scan failed", "error", err)
+				continue
+			}
+			metrics.SilentStations.Set(float64(len(silent)))
+			if len(silent) > 0 {
+				slog.Warn("stations are silent", "count", len(silent), "threshold", threshold.String())
+			}
 		}
 	}
 }
