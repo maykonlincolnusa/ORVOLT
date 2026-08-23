@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package orvolt.control.advice.v1;
+
+option go_package = "github.com/orvolt/orvolt/contracts/gen/go/orvolt/control/advice/v1;advicev1";
+
+// SiteChargingAdvice is a cloud-computed proposal for how much power the
+// chargers at a site could draw.
+//
+// It is an *observation about capacity*, not a command. Nothing in ORVOLT
+// applies it to equipment. Per ADR-005 a cloud-originated limit becomes an
+// electrical action only after site-local policy, an EVSE runtime and
+// hardware-enforced limits have each had the opportunity to refuse it. A
+// consumer that treats this message as authoritative has broken the safety
+// architecture, not extended it.
+message SiteChargingAdvice {
+  string site_id = 1;
+  int64 computed_at_ms = 2;
+
+  // The site's contracted or physical supply ceiling, in kilowatts. It is
+  // configuration, never a measurement.
+  double site_capacity_kw = 3;
+
+  // Everything at the site that is not vehicle charging.
+  double non_ev_load_kw = 4;
+
+  // What remains for charging after non-EV load and the safety margin.
+  double available_for_ev_kw = 5;
+
+  // Generation beyond what the site's own non-EV load consumes. A consumer that
+  // prefers self-consumption can charge within this figure instead of the full
+  // available headroom.
+  double solar_surplus_kw = 6;
+
+  repeated ConnectorAllocation allocations = 7;
+
+  // How much the advice can be trusted. A stale or missing energy observation
+  // must reduce optimisation, never silently authorise more power.
+  AdviceBasis basis = 8;
+
+  // Age of the energy observation the advice was computed from.
+  int64 observation_age_ms = 9;
+}
+
+message ConnectorAllocation {
+  string station_id = 1;
+  string connector_id = 2;
+  double max_power_kw = 3;
+  AllocationOutcome outcome = 4;
+}
+
+enum AllocationOutcome {
+  ALLOCATION_OUTCOME_UNSPECIFIED = 0;
+  // The connector may draw everything it asked for.
+  ALLOCATION_OUTCOME_FULL = 1;
+  // The connector may charge, below what it asked for.
+  ALLOCATION_OUTCOME_LIMITED = 2;
+  // There is not enough headroom for this connector to charge usefully.
+  // Below roughly 1.4 kW a vehicle typically stops accepting charge, so a
+  // share that small is worse than none: it occupies capacity and delivers
+  // nothing.
+  ALLOCATION_OUTCOME_PAUSED = 3;
+}
+
+enum AdviceBasis {
+  ADVICE_BASIS_UNSPECIFIED = 0;
+  // Computed from a fresh, measured energy observation.
+  ADVICE_BASIS_MEASURED = 1;
+  // The observation is older than the freshness window. A conservative
+  // fallback was used.
+  ADVICE_BASIS_STALE = 2;
+  // No observation at all. Only the configured capacity and margin were used.
+  ADVICE_BASIS_NO_DATA = 3;
+}

@@ -9,23 +9,33 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/orvolt/orvolt/cloud/control-plane/internal/advice"
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/domain"
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/metrics"
 )
 
 type API struct {
-	repository     domain.Repository
-	ready          func(context.Context) error
-	silenceAfter   time.Duration
-	maxRequestTime time.Duration
+	repository      domain.Repository
+	ready           func(context.Context) error
+	silenceAfter    time.Duration
+	advicePolicy    advice.Policy
+	demandFreshness time.Duration
+	maxRequestTime  time.Duration
 }
 
-func New(repository domain.Repository, ready func(context.Context) error, silenceAfter time.Duration) *API {
+func New(
+	repository domain.Repository,
+	ready func(context.Context) error,
+	silenceAfter time.Duration,
+	advicePolicy advice.Policy,
+) *API {
 	return &API{
-		repository:     repository,
-		ready:          ready,
-		silenceAfter:   silenceAfter,
-		maxRequestTime: 15 * time.Second,
+		repository:      repository,
+		ready:           ready,
+		silenceAfter:    silenceAfter,
+		advicePolicy:    advicePolicy,
+		demandFreshness: 2 * time.Minute,
+		maxRequestTime:  15 * time.Second,
 	}
 }
 
@@ -41,7 +51,54 @@ func (api *API) Handler() http.Handler {
 	api.route(mux, "GET /api/v1/fleet/silent-stations", "fleet.silent", api.silentStations)
 	api.route(mux, "GET /api/v1/sessions", "sessions.list", api.listSessions)
 	api.route(mux, "GET /api/v1/sessions/{sessionID}", "sessions.get", api.getSession)
+	api.route(mux, "GET /api/v1/sites/{siteID}/charging-advice", "advice.get", api.chargingAdvice)
 	return mux
+}
+
+// chargingAdvice returns how much power the site's chargers could draw.
+//
+// The response is a proposal, never an instruction. Nothing in ORVOLT applies
+// it to equipment; per ADR-005 a cloud-originated limit becomes an electrical
+// action only after site-local policy, an EVSE runtime and hardware limits have
+// each had the chance to refuse it.
+func (api *API) chargingAdvice(writer http.ResponseWriter, request *http.Request) {
+	siteID := request.PathValue("siteID")
+	policy := api.advicePolicy
+	if raw := request.URL.Query().Get("capacity_kw"); raw != "" {
+		capacity, err := strconv.ParseFloat(raw, 64)
+		if err != nil || capacity <= 0 {
+			writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "capacity_kw must be a positive number"})
+			return
+		}
+		policy.CapacityKW = capacity
+	}
+
+	demand, err := api.repository.ListSiteDemand(request.Context(), siteID, api.demandFreshness)
+	if err != nil {
+		writeJSON(writer, http.StatusInternalServerError, map[string]string{"error": "unable to read site demand"})
+		return
+	}
+
+	// A missing observation is not an error: it is the "no data" case, and the
+	// advice degrades to the conservative fallback rather than failing.
+	var latest *domain.EnergyObservation
+	if observation, found, err := api.repository.LatestEnergyObservation(request.Context(), siteID); err == nil && found {
+		latest = &observation
+	}
+
+	writeJSON(writer, http.StatusOK, advice.Compute(siteID, policy, latest, demandsOf(demand), time.Now().UTC()))
+}
+
+func demandsOf(connectors []domain.ConnectorDemand) []advice.Demand {
+	demands := make([]advice.Demand, 0, len(connectors))
+	for _, connector := range connectors {
+		demands = append(demands, advice.Demand{
+			StationID:   connector.StationID,
+			ConnectorID: connector.ConnectorID,
+			RequestedKW: connector.PowerKW,
+		})
+	}
+	return demands
 }
 
 // route registers a handler and records its outcome. Instrumenting at

@@ -14,6 +14,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 
+	"github.com/orvolt/orvolt/cloud/control-plane/internal/advice"
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/config"
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/httpapi"
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/ingest"
@@ -88,7 +89,26 @@ func run() error {
 		return err
 	}
 
-	api := httpapi.New(database, readiness(database, connection), settings.StationSilenceAfter)
+	// Fleet-wide defaults. A deployment with heterogeneous sites resolves these
+	// per site from a station registry, which ORVOLT does not yet have.
+	advicePolicy := advice.Policy{
+		CapacityKW:           settings.SiteCapacityKW,
+		SafetyMarginKW:       settings.SiteSafetyMarginKW,
+		FallbackKW:           settings.SiteFallbackKW,
+		ObservationFreshness: settings.ObservationFreshness,
+		MaxConnectorKW:       settings.MaxConnectorKW,
+	}
+
+	// Advice is published for site-local policy to consume. ORVOLT never
+	// applies it to equipment: per ADR-005 the cloud proposes and the site
+	// decides, mediated by an EVSE runtime and hardware limits.
+	advisor, err := advice.NewPublisher(ctx, stream, settings.AdviceSubject, database,
+		advicePolicy, settings.AdviceInterval, settings.StreamMaxAge)
+	if err != nil {
+		return err
+	}
+
+	api := httpapi.New(database, readiness(database, connection), settings.StationSilenceAfter, advicePolicy)
 	server := &http.Server{
 		Addr:              settings.HTTPAddr,
 		Handler:           api.Handler(),
@@ -96,7 +116,7 @@ func run() error {
 	}
 
 	var waitGroup sync.WaitGroup
-	for _, service := range []ingest.Service{telemetry, energy, sessions} {
+	for _, service := range []ingest.Service{telemetry, energy, sessions, advisor} {
 		waitGroup.Add(1)
 		go func(service ingest.Service) {
 			defer waitGroup.Done()

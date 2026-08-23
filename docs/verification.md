@@ -1,30 +1,74 @@
-# Initial Verification Record
+# Verification Record
 
-The following checks were run when this foundation was created:
+## How this is verified now
 
-| Check | Result |
+Everything below is checked by [CI](../.github/workflows/ci.yml) on every push
+and pull request. That is the change that matters: the previous record listed
+checks that had never been run because no automation existed to run them.
+
+| Check | Where |
 | --- | --- |
-| Repository structure and boundary documentation | Passed by inspection. |
-| Protobuf schema compilation | Passed with the Rust build's vendored `protoc`. |
-| C++ simulator build | Passed with CMake 4.2 and MSVC 19.51. |
-| C++ telemetry generation test | Passed: 1 of 1. |
-| Rust edge build and tests | Passed: 3 integration tests. |
-| Rust formatting and strict Clippy | Passed. |
-| Go control-plane build/tests | Not run: the `go` executable is not installed in the initial workspace. |
-| Root `make` workflow / Go binding generation | Not run: neither `make` nor `buf` is installed in the initial workspace. |
-| Docker Compose validation | Not run: the `docker` executable and Docker Compose are not installed in the initial workspace. |
-| PostgreSQL migration execution | Not run: neither Docker nor a `psql` client is installed in the initial workspace. |
-| End-to-end MQTT -> NATS -> PostgreSQL flow | Not run: Docker/Compose are unavailable in the initial workspace. |
+| Contract linting against the `buf` STANDARD ruleset | `contracts` job |
+| Contract formatting | `contracts` job |
+| Backwards-compatibility (`buf breaking`) against `main` | `contracts` job, pull requests |
+| Go: `go mod tidy` is clean, `gofmt`, `go build`, `go vet`, `go test -race` | `go` job |
+| Rust: `cargo fmt --check`, `clippy -D warnings`, `cargo test --locked` | `rust` job |
+| C++: CMake configure, build, `ctest` | `cpp` job |
+| End-to-end: `docker compose up`, readiness, telemetry reaching PostgreSQL and being served with its provenance | `e2e` job |
+| Static musl binaries for `aarch64`, `armv7` and `x86_64` | [`edge-release.yml`](../.github/workflows/edge-release.yml) |
 
-The container workflow is the intended validation path for the remaining checks: install Docker Compose, run `make up`, then query `http://localhost:8080/api/v1/stations/orvolt-sim-001/telemetry/latest`. The Go image generates its binding directly from `contracts/proto` before building, so a clean checkout does not require generated files to be committed.
+The cross-compile job asserts the binary is statically linked. A dynamically
+linked agent would need a matching libc on the charger's root filesystem, which
+is the thing musl exists to avoid.
 
-## Energy Architecture Extension
+## What the first record got wrong
 
-| Check | Result |
-| --- | --- |
-| `orvolt.energy.site.v1` Protobuf compilation | Passed with vendored `protoc`. |
-| Energy contract, JetStream consumer, migration, and API route structure | Passed by inspection. |
-| Go control-plane energy tests | Not run: the `go` executable is not installed in the initial workspace. |
-| Energy JetStream/PostgreSQL integration | Not run: Docker/Compose and PostgreSQL client are unavailable in the initial workspace. |
+The original version of this file recorded the Go control plane as "not run:
+the `go` executable is not installed in the initial workspace". That was
+accurate, and it hid two defects that had been committed:
 
-The SMA adapter remains intentionally unimplemented until approved sandbox OAuth credentials and sanctioned response fixtures are available. Its cloud-only, read-only scope is specified in `integrations/energy/sma/README.md`.
+1. There was no `go.sum` and `go.mod` listed no indirect requirements, so
+   `go build` failed on every dependency.
+2. Once that was fixed, `nats.NewJetStreamContext` turned out not to exist in
+   the NATS client library. The entire `ingest` package had never compiled.
+
+`buf lint` also reported 15 violations of the ruleset `buf.yaml` itself
+declares.
+
+None of these were subtle. They were invisible because "not run" was treated as
+an acceptable state for a check. It is not: a check that has never run is
+indistinguishable from a check that fails.
+
+## What is still not verified automatically
+
+Stated plainly, because the failure above came from a record that read as more
+complete than it was:
+
+- **No integration test against a real PostgreSQL.** The store layer's SQL is
+  exercised only by the end-to-end Compose run, so a defect in a query path that
+  run does not touch — session merging on out-of-order events, silent-station
+  scanning, site demand — would not be caught.
+- **No test against a real charge point.** The OCPP gateway's mapping and
+  handler logic are unit-tested, but nothing validates the wire behaviour
+  against certified hardware or the OCA test tool.
+- **No load or soak testing.** Batching, spool rotation under sustained
+  backpressure, and JetStream retention eviction are reasoned about, not
+  measured.
+- **No test of the systemd unit.** The watchdog and readiness integration is
+  implemented and unit-tested at the parsing level; nothing boots it under
+  systemd and confirms a wedged agent is actually restarted.
+- **No hardware-in-the-loop testing of any kind**, and none should be attempted
+  with real high-voltage equipment without the engineering and certification
+  described in [architecture/system-overview.md](architecture/system-overview.md).
+
+## Energy provider integrations
+
+The `orvolt.energy.site.v1` contract, its JetStream consumer, persistence and
+latest-observation API are implemented and tested. **No provider client exists.**
+The SMA adapter remains unimplemented until approved sandbox OAuth credentials
+and sanctioned response fixtures are available; its cloud-only, read-only scope
+is specified in [`integrations/energy/sma/README.md`](../integrations/energy/sma/README.md).
+
+Load management consumes whatever observations arrive and falls back to a
+conservative limit when none do, so the absence of a provider reduces
+optimisation rather than blocking the feature.

@@ -42,6 +42,19 @@ type Config struct {
 	// silent. Losing sight of a charger is the primary operational signal in a
 	// charging network.
 	StationSilenceAfter time.Duration
+
+	// Default site load-management policy. A real deployment resolves these per
+	// site from a station registry; these are the fleet-wide defaults.
+	SiteCapacityKW       float64
+	SiteSafetyMarginKW   float64
+	SiteFallbackKW       float64
+	ObservationFreshness time.Duration
+	MaxConnectorKW       float64
+
+	// Advisory capacity proposals. Published for site-local policy to consume;
+	// never applied to equipment by ORVOLT itself.
+	AdviceSubject  string
+	AdviceInterval time.Duration
 }
 
 func Load() Config {
@@ -69,6 +82,15 @@ func Load() Config {
 		BatchInterval: envDuration("INGEST_BATCH_INTERVAL", 250*time.Millisecond),
 
 		StationSilenceAfter: envDuration("STATION_SILENCE_AFTER", 5*time.Minute),
+
+		SiteCapacityKW:       envFloat("SITE_CAPACITY_KW", 100),
+		SiteSafetyMarginKW:   envFloat("SITE_SAFETY_MARGIN_KW", 5),
+		SiteFallbackKW:       envFloat("SITE_FALLBACK_KW", 20),
+		ObservationFreshness: envDuration("ENERGY_OBSERVATION_FRESHNESS", 5*time.Minute),
+		MaxConnectorKW:       envFloat("MAX_CONNECTOR_KW", 350),
+
+		AdviceSubject:  env("ADVICE_NATS_SUBJECT", "orvolt.control.advice.v1"),
+		AdviceInterval: envDuration("ADVICE_INTERVAL", 30*time.Second),
 	}
 }
 
@@ -113,6 +135,19 @@ func envDuration(name string, fallback time.Duration) time.Duration {
 	value, err := time.ParseDuration(raw)
 	if err != nil || value <= 0 {
 		slog.Warn("ignoring invalid duration configuration", "name", name, "value", raw, "fallback", fallback)
+		return fallback
+	}
+	return value
+}
+
+func envFloat(name string, fallback float64) float64 {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseFloat(raw, 64)
+	if err != nil || value <= 0 {
+		slog.Warn("ignoring invalid numeric configuration", "name", name, "value", raw, "fallback", fallback)
 		return fallback
 	}
 	return value

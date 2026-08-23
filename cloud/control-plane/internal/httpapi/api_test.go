@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/orvolt/orvolt/cloud/control-plane/internal/advice"
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/domain"
 	"github.com/orvolt/orvolt/cloud/control-plane/internal/httpapi"
 )
@@ -18,6 +19,7 @@ type repository struct {
 	telemetry        domain.Telemetry
 	energy           domain.EnergyObservation
 	silent           []domain.StationHealth
+	demand           []domain.ConnectorDemand
 	sessions         []domain.Session
 	lastPage         domain.Page
 	lastSessionQuery domain.SessionQuery
@@ -61,6 +63,20 @@ func (*repository) PersistSessionEventBatch(context.Context, []domain.SessionEve
 	return nil
 }
 
+func (repo *repository) ListSiteDemand(_ context.Context, siteID string, _ time.Duration) ([]domain.ConnectorDemand, error) {
+	matching := make([]domain.ConnectorDemand, 0, len(repo.demand))
+	for _, connector := range repo.demand {
+		if siteID == repo.energy.SiteID {
+			matching = append(matching, connector)
+		}
+	}
+	return matching, nil
+}
+
+func (repo *repository) ListActiveSites(context.Context, time.Duration) ([]string, error) {
+	return []string{repo.energy.SiteID}, nil
+}
+
 func (repo *repository) GetSession(_ context.Context, sessionID string) (domain.Session, bool, error) {
 	for _, session := range repo.sessions {
 		if session.SessionID == sessionID {
@@ -89,7 +105,13 @@ func (repo *repository) ListSessions(_ context.Context, query domain.SessionQuer
 }
 
 func newAPI(repo *repository) http.Handler {
-	return httpapi.New(repo, func(context.Context) error { return nil }, 5*time.Minute).Handler()
+	return httpapi.New(repo, func(context.Context) error { return nil }, 5*time.Minute, advice.Policy{
+		CapacityKW:           100,
+		SafetyMarginKW:       5,
+		FallbackKW:           20,
+		ObservationFreshness: 5 * time.Minute,
+		MaxConnectorKW:       50,
+	}).Handler()
 }
 
 func sampleRepository() *repository {
@@ -119,6 +141,7 @@ func TestRoutesAnswer(t *testing.T) {
 		"/api/v1/fleet/silent-stations",
 		"/api/v1/sessions",
 		"/api/v1/sessions/ocpp16:station-1:900",
+		"/api/v1/sites/site-1/charging-advice",
 	}
 	for _, path := range paths {
 		response := httptest.NewRecorder()
@@ -126,6 +149,42 @@ func TestRoutesAnswer(t *testing.T) {
 		if response.Code != http.StatusOK {
 			t.Errorf("%s returned %d: %s", path, response.Code, response.Body.String())
 		}
+	}
+}
+
+// The advice endpoint must answer even for a site nothing is known about: a
+// provider outage reduces optimisation, it does not fail the request. And what
+// it answers must be the conservative fallback, never the site's full capacity.
+func TestChargingAdviceDegradesInsteadOfFailing(t *testing.T) {
+	api := newAPI(sampleRepository())
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/sites/unknown-site/charging-advice", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected an answer for an unknown site, got %d: %s", response.Code, response.Body.String())
+	}
+
+	var payload struct {
+		Basis            string  `json:"basis"`
+		AvailableForEVKW float64 `json:"available_for_ev_kw"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if payload.Basis != advice.BasisNoData {
+		t.Errorf("expected a no-data basis, got %q", payload.Basis)
+	}
+	if payload.AvailableForEVKW != 15 {
+		t.Errorf("expected the conservative fallback of 15 kW, got %v", payload.AvailableForEVKW)
+	}
+}
+
+func TestChargingAdviceRejectsInvalidCapacity(t *testing.T) {
+	api := newAPI(sampleRepository())
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+		"/api/v1/sites/site-1/charging-advice?capacity_kw=-10", nil))
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for a negative capacity, got %d", response.Code)
 	}
 }
 

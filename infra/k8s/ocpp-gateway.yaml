@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ocpp-gateway
+  labels:
+    app.kubernetes.io/name: ocpp-gateway
+    app.kubernetes.io/part-of: orvolt
+spec:
+  # Deliberately one. Charge points hold long-lived WebSockets, so a replica's
+  # connections are not shareable, and the bundled transaction-id allocator is
+  # per-process: two replicas could issue the same id and corrupt billing.
+  # Implement csms.TransactionIDs against a shared durable sequence before
+  # raising this.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ocpp-gateway
+  strategy:
+    # Recreate, not RollingUpdate: two gateways running at once is exactly the
+    # condition the single-replica constraint exists to prevent.
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ocpp-gateway
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: ocpp-gateway
+          image: ghcr.io/maykonlincolnusa/orvolt-ocpp-gateway:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: ocpp
+              containerPort: 8887
+            - name: http
+              containerPort: 8081
+          envFrom:
+            - configMapRef:
+                name: orvolt-config
+            - secretRef:
+                name: orvolt-secrets
+          env:
+            - name: NATS_CREDENTIALS
+              value: /etc/orvolt/nats.creds
+          volumeMounts:
+            - name: nats-credentials
+              mountPath: /etc/orvolt
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 6
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: nats-credentials
+          secret:
+            secretName: orvolt-secrets
+            items:
+              - key: nats.creds
+                path: nats.creds
+            defaultMode: 0400
+      # Long enough for charge points to be told the connection is closing
+      # rather than discovering it by timeout.
+      terminationGracePeriodSeconds: 60
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ocpp-gateway
+  annotations:
+    # Charge points idle for long stretches between messages. An ingress with a
+    # short idle timeout will disconnect the entire fleet on a loop.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  selector:
+    app.kubernetes.io/name: ocpp-gateway
+  ports:
+    - name: ocpp
+      port: 8887
+      targetPort: ocpp
+    - name: http
+      port: 8081
+      targetPort: http

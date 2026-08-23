@@ -109,8 +109,21 @@ func (page Page) Normalize() Page {
 	return page
 }
 
+// ConnectorDemand is one connector's latest power draw, used as the practical
+// stand-in for what it would draw unconstrained.
+type ConnectorDemand struct {
+	StationID   string    `json:"station_id"`
+	ConnectorID string    `json:"connector_id"`
+	PowerKW     float64   `json:"power_kw"`
+	State       string    `json:"state"`
+	ObservedAt  time.Time `json:"observed_at"`
+}
+
 type Repository interface {
 	SessionRepository
+
+	ListSiteDemand(ctx context.Context, siteID string, within time.Duration) ([]ConnectorDemand, error)
+	ListActiveSites(ctx context.Context, within time.Duration) ([]string, error)
 
 	PersistTelemetryBatch(context.Context, []Telemetry) error
 	PersistEnergyObservationBatch(context.Context, []EnergyObservation) error
