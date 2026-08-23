@@ -14,11 +14,13 @@ import (
 )
 
 type repository struct {
-	stations  []domain.Station
-	telemetry domain.Telemetry
-	energy    domain.EnergyObservation
-	silent    []domain.StationHealth
-	lastPage  domain.Page
+	stations         []domain.Station
+	telemetry        domain.Telemetry
+	energy           domain.EnergyObservation
+	silent           []domain.StationHealth
+	sessions         []domain.Session
+	lastPage         domain.Page
+	lastSessionQuery domain.SessionQuery
 }
 
 func (*repository) PersistTelemetryBatch(context.Context, []domain.Telemetry) error { return nil }
@@ -55,6 +57,37 @@ func (repo *repository) ListSilentStations(context.Context, time.Duration) ([]do
 	return repo.silent, nil
 }
 
+func (*repository) PersistSessionEventBatch(context.Context, []domain.SessionEvent) error {
+	return nil
+}
+
+func (repo *repository) GetSession(_ context.Context, sessionID string) (domain.Session, bool, error) {
+	for _, session := range repo.sessions {
+		if session.SessionID == sessionID {
+			return session, true, nil
+		}
+	}
+	return domain.Session{}, false, nil
+}
+
+func (repo *repository) ListSessions(_ context.Context, query domain.SessionQuery) ([]domain.Session, error) {
+	repo.lastSessionQuery = query
+	matching := make([]domain.Session, 0, len(repo.sessions))
+	for _, session := range repo.sessions {
+		if query.StationID != "" && session.StationID != query.StationID {
+			continue
+		}
+		if query.OpenOnly && !session.Open {
+			continue
+		}
+		matching = append(matching, session)
+	}
+	if query.Page.Limit < len(matching) {
+		return matching[:query.Page.Limit], nil
+	}
+	return matching, nil
+}
+
 func newAPI(repo *repository) http.Handler {
 	return httpapi.New(repo, func(context.Context) error { return nil }, 5*time.Minute).Handler()
 }
@@ -64,6 +97,11 @@ func sampleRepository() *repository {
 		stations:  []domain.Station{{StationID: "station-1", LastSeenAt: time.Unix(1, 0)}},
 		telemetry: domain.Telemetry{StationID: "station-1", ConnectorID: "1", Timestamp: time.Unix(1, 0)},
 		energy:    domain.EnergyObservation{SiteID: "site-1", Provider: "SMA", ObservedAt: time.Unix(1, 0)},
+		sessions: []domain.Session{
+			{SessionID: "ocpp16:station-1:900", StationID: "station-1", Open: false},
+			{SessionID: "ocpp16:station-1:901", StationID: "station-1", Open: true},
+			{SessionID: "ocpp16:station-2:902", StationID: "station-2", Open: true},
+		},
 	}
 }
 
@@ -79,6 +117,8 @@ func TestRoutesAnswer(t *testing.T) {
 		"/api/v1/stations/station-1/telemetry/latest",
 		"/api/v1/energy/sites/site-1/latest",
 		"/api/v1/fleet/silent-stations",
+		"/api/v1/sessions",
+		"/api/v1/sessions/ocpp16:station-1:900",
 	}
 	for _, path := range paths {
 		response := httptest.NewRecorder()
@@ -180,6 +220,41 @@ func TestSilentStationsReportsThreshold(t *testing.T) {
 	}
 	if len(payload.Stations) != 1 {
 		t.Fatalf("expected one silent station, got %d", len(payload.Stations))
+	}
+}
+
+// Open sessions are the ones an operator chases: they hold a connector and are
+// the usual root of a billing dispute.
+func TestSessionListingFiltersOpenSessions(t *testing.T) {
+	repo := sampleRepository()
+	api := newAPI(repo)
+
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/sessions?open=true&station=station-1", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("unexpected status %d", response.Code)
+	}
+
+	var payload struct {
+		Sessions []domain.Session `json:"sessions"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decoding response: %v", err)
+	}
+	if len(payload.Sessions) != 1 || payload.Sessions[0].SessionID != "ocpp16:station-1:901" {
+		t.Fatalf("expected only the open session of station-1, got %+v", payload.Sessions)
+	}
+	if !repo.lastSessionQuery.OpenOnly || repo.lastSessionQuery.StationID != "station-1" {
+		t.Errorf("filters were not passed through: %+v", repo.lastSessionQuery)
+	}
+}
+
+func TestUnknownSessionIsNotFound(t *testing.T) {
+	api := newAPI(sampleRepository())
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v1/sessions/does-not-exist", nil))
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for an unknown session, got %d", response.Code)
 	}
 }
 

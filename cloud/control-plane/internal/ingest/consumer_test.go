@@ -15,16 +15,25 @@ import (
 
 var ingestedAt = time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
 
+const telemetrySubject = "orvolt.telemetry.evse.v1"
+
 // fakeMessage records how the runner disposed of a message.
 type fakeMessage struct {
 	payload []byte
+	subject string
 	acked   int
 	naked   int
 	termed  int
 }
 
 func (message *fakeMessage) Data() []byte { return message.payload }
-func (message *fakeMessage) Ack() error   { message.acked++; return nil }
+func (message *fakeMessage) Subject() string {
+	if message.subject == "" {
+		return telemetrySubject
+	}
+	return message.subject
+}
+func (message *fakeMessage) Ack() error { message.acked++; return nil }
 func (message *fakeMessage) NakWithDelay(time.Duration) error {
 	message.naked++
 	return nil

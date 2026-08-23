@@ -13,11 +13,14 @@ import (
 // The mapping is explicit so that renaming a Protobuf enum value can never
 // silently rewrite historical rows.
 var chargingStates = map[evsev1.ChargingState]string{
-	evsev1.ChargingState_CHARGING_STATE_AVAILABLE: "AVAILABLE",
-	evsev1.ChargingState_CHARGING_STATE_PREPARING: "PREPARING",
-	evsev1.ChargingState_CHARGING_STATE_CHARGING:  "CHARGING",
-	evsev1.ChargingState_CHARGING_STATE_FINISHING: "FINISHING",
-	evsev1.ChargingState_CHARGING_STATE_FAULTED:   "FAULTED",
+	evsev1.ChargingState_CHARGING_STATE_AVAILABLE:   "AVAILABLE",
+	evsev1.ChargingState_CHARGING_STATE_PREPARING:   "PREPARING",
+	evsev1.ChargingState_CHARGING_STATE_CHARGING:    "CHARGING",
+	evsev1.ChargingState_CHARGING_STATE_FINISHING:   "FINISHING",
+	evsev1.ChargingState_CHARGING_STATE_FAULTED:     "FAULTED",
+	evsev1.ChargingState_CHARGING_STATE_SUSPENDED:   "SUSPENDED",
+	evsev1.ChargingState_CHARGING_STATE_RESERVED:    "RESERVED",
+	evsev1.ChargingState_CHARGING_STATE_UNAVAILABLE: "UNAVAILABLE",
 }
 
 var clockSyncStates = map[evsev1.ClockSync]string{

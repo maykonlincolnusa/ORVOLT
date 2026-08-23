@@ -278,15 +278,22 @@ mod tests {
         );
     }
 
+    /// A directory unique to one test.
+    ///
+    /// This deliberately does not use the wall clock: Windows advances it in
+    /// ~15 ms steps, so two tests starting in the same tick received the same
+    /// "unique" name and shared a spool, which made one test observe another's
+    /// records.
     fn tempdir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let base = std::env::temp_dir().join(format!(
-            "orvolt-spool-test-{}-{:?}",
+            "orvolt-spool-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
+        let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("create temp dir");
         base
     }

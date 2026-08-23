@@ -71,12 +71,19 @@ func run() error {
 	}
 
 	telemetry, err := ingest.NewTelemetryRunner(ctx, stream, database, settings.TelemetrySubject,
-		deadLetter, settings.StreamMaxAge, settings.StreamMaxBytes, settings.BatchSize, settings.BatchInterval)
+		deadLetter, settings.StreamMaxAge, settings.StreamMaxBytes, settings.BatchSize, settings.BatchInterval, settings.RequireDeviceIdentity)
 	if err != nil {
 		return err
 	}
 	energy, err := ingest.NewEnergyRunner(ctx, stream, database, settings.EnergySubject,
 		deadLetter, settings.StreamMaxAge, settings.StreamMaxBytes, settings.BatchSize, settings.BatchInterval)
+	if err != nil {
+		return err
+	}
+	// Sessions are billing evidence, so they are retained for far longer than
+	// telemetry and never share the high-volume stream's eviction policy.
+	sessions, err := ingest.NewSessionRunner(ctx, stream, database, settings.SessionSubject,
+		deadLetter, settings.SessionRetention, settings.StreamMaxBytes, settings.BatchSize, settings.BatchInterval)
 	if err != nil {
 		return err
 	}
@@ -89,7 +96,7 @@ func run() error {
 	}
 
 	var waitGroup sync.WaitGroup
-	for _, service := range []ingest.Service{telemetry, energy} {
+	for _, service := range []ingest.Service{telemetry, energy, sessions} {
 		waitGroup.Add(1)
 		go func(service ingest.Service) {
 			defer waitGroup.Done()

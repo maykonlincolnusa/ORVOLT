@@ -9,12 +9,12 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # Bindings are generated from the canonical contracts rather than committed, so
-# a clean checkout can always be container-built.
+# a clean checkout can always be container-built. The generation step is shared
+# with the other services: listing .proto files per image is how one service
+# ends up unable to compile a contract another one already uses.
 COPY contracts/proto ./contracts/proto
-RUN mkdir -p contracts/gen/go && protoc -I contracts/proto \
-    --go_out=contracts/gen/go --go_opt=paths=source_relative \
-    contracts/proto/orvolt/telemetry/evse/v1/telemetry.proto \
-    contracts/proto/orvolt/energy/site/v1/energy_site.proto
+COPY scripts/generate-go-bindings.sh ./scripts/
+RUN sh scripts/generate-go-bindings.sh contracts/gen/go
 
 COPY cloud ./cloud
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/control-plane ./cloud/control-plane/cmd/control-plane

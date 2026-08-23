@@ -3,7 +3,9 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -37,6 +39,8 @@ func (api *API) Handler() http.Handler {
 	api.route(mux, "GET /api/v1/stations/{stationID}/telemetry/latest", "telemetry.latest", api.latestTelemetry)
 	api.route(mux, "GET /api/v1/energy/sites/{siteID}/latest", "energy.latest", api.latestEnergy)
 	api.route(mux, "GET /api/v1/fleet/silent-stations", "fleet.silent", api.silentStations)
+	api.route(mux, "GET /api/v1/sessions", "sessions.list", api.listSessions)
+	api.route(mux, "GET /api/v1/sessions/{sessionID}", "sessions.get", api.getSession)
 	return mux
 }
 
@@ -72,17 +76,26 @@ type stationPage struct {
 	Next     string           `json:"next,omitempty"`
 }
 
-func (api *API) listStations(writer http.ResponseWriter, request *http.Request) {
-	page := domain.Page{After: request.URL.Query().Get("after")}
-	if raw := request.URL.Query().Get("limit"); raw != "" {
+// pageFrom reads the shared cursor parameters. Every listing in this API is
+// bounded, so the parsing lives in one place.
+func (api *API) pageFrom(query url.Values) (domain.Page, error) {
+	page := domain.Page{After: query.Get("after")}
+	if raw := query.Get("limit"); raw != "" {
 		limit, err := strconv.Atoi(raw)
 		if err != nil || limit <= 0 {
-			writeJSON(writer, http.StatusBadRequest, map[string]string{"error": "limit must be a positive integer"})
-			return
+			return domain.Page{}, errors.New("limit must be a positive integer")
 		}
 		page.Limit = limit
 	}
-	page = page.Normalize()
+	return page.Normalize(), nil
+}
+
+func (api *API) listStations(writer http.ResponseWriter, request *http.Request) {
+	page, err := api.pageFrom(request.URL.Query())
+	if err != nil {
+		writeJSON(writer, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
 
 	stations, err := api.repository.ListStations(request.Context(), page)
 	if err != nil {
@@ -160,6 +173,51 @@ func (api *API) silentStations(writer http.ResponseWriter, request *http.Request
 		ThresholdSeconds: threshold.Seconds(),
 		Stations:         stations,
 	})
+}
+
+type sessionPage struct {
+	Sessions []domain.Session `json:"sessions"`
+	Next     string           `json:"next,omitempty"`
+}
+
+func (api *API) listSessions(writer http.ResponseWriter, request *http.Request) {
+	query := request.URL.Query()
+	page, err := api.pageFrom(query)
+	if err != nil {
+		writeJSON(writer, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	sessionQuery := domain.SessionQuery{
+		StationID: query.Get("station"),
+		// Open sessions are the ones an operator chases: they hold a connector
+		// and they are the usual root of a billing dispute.
+		OpenOnly: query.Get("open") == "true",
+		Page:     page,
+	}
+
+	sessions, err := api.repository.ListSessions(request.Context(), sessionQuery)
+	if err != nil {
+		writeJSON(writer, http.StatusInternalServerError, map[string]string{"error": "unable to list sessions"})
+		return
+	}
+	response := sessionPage{Sessions: sessions}
+	if len(sessions) == page.Limit {
+		response.Next = sessions[len(sessions)-1].SessionID
+	}
+	writeJSON(writer, http.StatusOK, response)
+}
+
+func (api *API) getSession(writer http.ResponseWriter, request *http.Request) {
+	session, found, err := api.repository.GetSession(request.Context(), request.PathValue("sessionID"))
+	if err != nil {
+		writeJSON(writer, http.StatusInternalServerError, map[string]string{"error": "unable to get session"})
+		return
+	}
+	if !found {
+		writeJSON(writer, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	writeJSON(writer, http.StatusOK, session)
 }
 
 type statusRecorder struct {

@@ -1,0 +1,74 @@
+name: Edge agent release artifacts
+
+# The deliverable for a charger is not a container image. It is a statically
+# linked binary for the controller's architecture, plus the unit file that
+# supervises it. This workflow produces exactly that.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "edge/**"
+      - "contracts/**"
+      - ".github/workflows/edge-release.yml"
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  cross-compile:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 64-bit ARM covers the i.MX8 and CM4 class controllers most modern
+          # chargers use.
+          - target: aarch64-unknown-linux-musl
+          # 32-bit ARM covers older i.MX6 and similar boards still in the field.
+          - target: armv7-unknown-linux-musleabihf
+          # Used for bench work and for validating the static link itself.
+          - target: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: edge/orvolt-edge-agent
+          key: ${{ matrix.target }}
+      - name: Install cross
+        run: cargo install cross --locked --version 0.2.5
+      - name: Build
+        run: |
+          cross build --release --locked \
+            --manifest-path edge/orvolt-edge-agent/Cargo.toml \
+            --target ${{ matrix.target }}
+      - name: Verify the binary is statically linked
+        # A dynamically linked binary would need a matching libc on the
+        # charger's root filesystem, which is exactly what musl avoids.
+        run: |
+          binary=edge/orvolt-edge-agent/target/${{ matrix.target }}/release/orvolt-edge-agent
+          file "$binary"
+          if file "$binary" | grep -q "dynamically linked"; then
+            echo "binary is dynamically linked; it will not run on a minimal charger image" >&2
+            exit 1
+          fi
+          ls -lh "$binary"
+      - name: Stage the package
+        run: |
+          staging="orvolt-edge-agent-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp edge/orvolt-edge-agent/target/${{ matrix.target }}/release/orvolt-edge-agent "$staging/"
+          cp edge/packaging/orvolt-edge-agent.service "$staging/"
+          cp edge/packaging/edge-agent.env.example "$staging/"
+          cp edge/packaging/README.md "$staging/"
+          cp LICENSE "$staging/"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: orvolt-edge-agent-${{ matrix.target }}
+          path: orvolt-edge-agent-${{ matrix.target }}/
+          if-no-files-found: error

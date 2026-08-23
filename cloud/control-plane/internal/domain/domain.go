@@ -110,6 +110,8 @@ func (page Page) Normalize() Page {
 }
 
 type Repository interface {
+	SessionRepository
+
 	PersistTelemetryBatch(context.Context, []Telemetry) error
 	PersistEnergyObservationBatch(context.Context, []EnergyObservation) error
 	ListStations(context.Context, Page) ([]Station, error)

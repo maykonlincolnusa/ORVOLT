@@ -11,13 +11,16 @@
 //! * [`spool`] — durable, bounded store-and-forward on local flash.
 //! * [`pipeline`] — delivery policy over an abstract transport.
 //! * [`clock`] — wall-clock trust and observation ordering.
+//! * [`subject`] — addressing the device's own authenticated subject.
 //! * [`observability`] — local health and metrics for on-site diagnosis.
 
 pub mod clock;
 pub mod observability;
 pub mod pipeline;
 pub mod spool;
+pub mod subject;
 pub mod telemetry;
+pub mod watchdog;
 
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/orvolt.telemetry.evse.v1.rs"));

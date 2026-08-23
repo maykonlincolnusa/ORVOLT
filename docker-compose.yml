@@ -57,6 +57,37 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  # Accepts real OCPP 1.6J charge points. The simulator path does not use it;
+  # it is here so a physical charger can be pointed at ws://host:8887/ocpp/<id>
+  # without any other change.
+  ocpp-gateway:
+    build:
+      context: .
+      dockerfile: cloud/ocpp-gateway/Dockerfile
+    environment:
+      NATS_URL: nats://nats:4222
+      NATS_SUBJECT: orvolt.telemetry.evse.v1
+      SESSION_NATS_SUBJECT: orvolt.session.evse.v1
+      GATEWAY_ID: ocpp-gateway-001
+      SITE_ID: site-dev-001
+      HTTP_ADDR: :8081
+      # Development pepper only. A deployment must supply its own secret, and
+      # changing it re-identifies every card, so it belongs in a secret manager.
+      TOKEN_PEPPER: ${TOKEN_PEPPER:-development-only-pepper-do-not-use-in-production}
+      # Defaults to refusing every token: ORVOLT has no authorization service,
+      # and approving unknown cards would let anyone charge for free.
+      AUTHORIZATION_MODE: ${AUTHORIZATION_MODE:-deny-all}
+    ports:
+      - "8887:8887"
+      - "8081:8081"
+    depends_on:
+      nats:
+        condition: service_started
+      # The control plane owns stream configuration; the gateway waits for it.
+      control-plane:
+        condition: service_started
+    restart: unless-stopped
+
   edge-agent:
     build:
       context: .

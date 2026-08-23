@@ -33,6 +33,10 @@ const (
 // without a running broker.
 type message interface {
 	Data() []byte
+	// Subject carries the publisher's identity. NATS enforces which subjects a
+	// credential may publish to, so the subject is the one part of a message a
+	// device cannot forge.
+	Subject() string
 	Ack() error
 	NakWithDelay(delay time.Duration) error
 	Term() error
@@ -62,6 +66,7 @@ type Runner[T any] struct {
 	consumer   jetstream.Consumer
 	decode     Decoder[T]
 	persist    Persister[T]
+	verify     Verifier[T]
 	deadLetter *DeadLetter
 	batchSize  int
 	batchWait  time.Duration
@@ -93,11 +98,15 @@ func NewRunner[T any](
 	created, err := stream.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:        spec.Stream,
 		Description: spec.Description,
-		Subjects:    []string{spec.Subject},
-		Storage:     jetstream.FileStorage,
-		Retention:   jetstream.LimitsPolicy,
-		MaxAge:      spec.MaxAge,
-		MaxBytes:    spec.MaxBytes,
+		// Publishers address their own subject below the base one, so that the
+		// broker's per-credential publish permissions become an authenticated
+		// statement of who sent each message. The bare base subject stays
+		// accepted for unidentified development publishers.
+		Subjects:  []string{spec.Subject, spec.Subject + ".>"},
+		Storage:   jetstream.FileStorage,
+		Retention: jetstream.LimitsPolicy,
+		MaxAge:    spec.MaxAge,
+		MaxBytes:  spec.MaxBytes,
 		// Drop the oldest observations rather than refusing new ones. Losing
 		// history is recoverable; a charger unable to publish is not.
 		Discard: jetstream.DiscardOld,
@@ -129,6 +138,13 @@ func NewRunner[T any](
 }
 
 func (runner *Runner[T]) Name() string { return runner.name }
+
+// WithVerifier installs an origin check applied after decoding and before
+// persistence.
+func (runner *Runner[T]) WithVerifier(verify Verifier[T]) *Runner[T] {
+	runner.verify = verify
+	return runner
+}
 
 // Run consumes until the context is cancelled.
 func (runner *Runner[T]) Run(ctx context.Context) error {
@@ -174,6 +190,12 @@ func (runner *Runner[T]) ProcessBatch(ctx context.Context, messages []message) {
 
 	for _, received := range messages {
 		value, err := runner.decode(received.Data(), ingestedAt)
+		if err == nil && runner.verify != nil {
+			// The payload has been read; now check that the sender is who the
+			// payload says it is. A device can write anything into its own
+			// message, but it cannot publish to another device's subject.
+			err = runner.verify(received.Subject(), value)
+		}
 		if err == nil {
 			decoded = append(decoded, value)
 			accepted = append(accepted, received)
@@ -247,8 +269,9 @@ func NewTelemetryRunner(
 	maxBytes int64,
 	batchSize int,
 	batchWait time.Duration,
+	requireDeviceIdentity bool,
 ) (*Runner[domain.Telemetry], error) {
-	return NewRunner(
+	runner, err := NewRunner(
 		ctx,
 		stream,
 		StreamSpec{
@@ -274,4 +297,8 @@ func NewTelemetryRunner(
 		batchSize,
 		batchWait,
 	)
+	if err != nil {
+		return nil, err
+	}
+	return runner.WithVerifier(VerifyTelemetryOrigin(subject, requireDeviceIdentity)), nil
 }

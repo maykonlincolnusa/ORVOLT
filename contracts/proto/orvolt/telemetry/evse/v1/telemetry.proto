@@ -44,6 +44,14 @@ enum ChargingState {
   CHARGING_STATE_CHARGING = 3;
   CHARGING_STATE_FINISHING = 4;
   CHARGING_STATE_FAULTED = 5;
+
+  // Plugged in and authorized, but no energy is flowing because either the
+  // vehicle or the equipment paused it. Collapsing this into CHARGING would
+  // make a stalled session look healthy, which is the single most common
+  // false-negative in charger monitoring.
+  CHARGING_STATE_SUSPENDED = 6;
+  CHARGING_STATE_RESERVED = 7;
+  CHARGING_STATE_UNAVAILABLE = 8;
 }
 
 enum ClockSync {

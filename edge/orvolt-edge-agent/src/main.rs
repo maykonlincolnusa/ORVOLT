@@ -10,6 +10,8 @@ use orvolt_edge_agent::clock::{self, ClockTrust, Sequence};
 use orvolt_edge_agent::observability::{self, Metrics};
 use orvolt_edge_agent::pipeline::{Forwarder, SinkError, TelemetrySink};
 use orvolt_edge_agent::spool::{Spool, SpoolConfig};
+use orvolt_edge_agent::subject;
+use orvolt_edge_agent::watchdog;
 use orvolt_edge_agent::{encode, normalize, parse_payload, EdgeContext};
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
 use tokio::time::{interval, sleep};
@@ -187,10 +189,17 @@ async fn main() -> anyhow::Result<()> {
     .with_context(|| format!("opening the telemetry spool at {:?}", config.spool_dir))?;
     info!(directory = ?config.spool_dir, "telemetry spool ready");
 
+    // Publish under this device's own identity. The control plane compares the
+    // subject the broker authenticated against the identity inside the payload,
+    // which is what stops one station reporting as another.
+    let subject = subject::device_subject(&config.nats_subject, &config.edge_id)
+        .with_context(|| format!("EDGE_ID {:?} cannot address a subject", config.edge_id))?;
+    info!(subject = %subject, "publishing under the device identity");
+
     let sink = NatsSink::new(
         config.nats_url.clone(),
         config.nats_credentials.clone(),
-        config.nats_subject.clone(),
+        subject,
         Arc::clone(&metrics),
     );
     let mut forwarder = Forwarder::new(spool, sink, config.publish_batch_size);
@@ -204,6 +213,17 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let mut flush = interval(Duration::from_millis(config.flush_interval_ms.max(50)));
+
+    // Tell systemd startup finished. Until this arrives a Type=notify unit is
+    // considered still starting, and dependent units keep waiting.
+    watchdog::ready();
+    let keepalive = watchdog::keepalive_interval();
+    if let Some(period) = keepalive {
+        info!(
+            period_ms = period.as_millis() as u64,
+            "systemd watchdog active"
+        );
+    }
 
     loop {
         let mut mqtt_options =
@@ -221,12 +241,20 @@ async fn main() -> anyhow::Result<()> {
             tokio::select! {
                 signal = tokio::signal::ctrl_c() => {
                     signal.context("waiting for shutdown signal")?;
+                    watchdog::stopping();
                     info!("edge agent shutting down; flushing spool");
                     drain(&mut forwarder, &metrics).await;
                     return Ok(());
                 }
                 _ = flush.tick() => {
                     drain(&mut forwarder, &metrics).await;
+                    // The keepalive is sent from inside the working loop and
+                    // only after a drain attempt completed. A ping emitted by
+                    // an independent timer would keep reporting health for a
+                    // process that had stopped doing anything.
+                    if keepalive.is_some() {
+                        watchdog::alive();
+                    }
                 }
                 event = event_loop.poll() => match event {
                     Ok(Event::Incoming(Incoming::ConnAck(_))) => {

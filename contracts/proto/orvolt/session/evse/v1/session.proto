@@ -1,0 +1,96 @@
+syntax = "proto3";
+
+package orvolt.session.evse.v1;
+
+option go_package = "github.com/orvolt/orvolt/contracts/gen/go/orvolt/session/evse/v1;sessionv1";
+
+// ChargingSessionEvent reports a transition in a charging transaction.
+//
+// Telemetry answers "what is this connector doing right now". A session answers
+// "how much energy was delivered to whom, between when and when" — which is the
+// question billing, reporting, roaming and dispute resolution all ask. They are
+// separate streams because they have different retention, different privacy
+// obligations and different correctness requirements: a lost telemetry sample
+// is a gap in a chart, a lost session is a lost invoice.
+message ChargingSessionEvent {
+  // Stable identifier assigned by whichever adapter opened the session. It must
+  // survive reconnects so that a start and its stop can be joined.
+  string session_id = 1;
+  string station_id = 2;
+  string connector_id = 3;
+  string site_id = 4;
+
+  SessionEventType type = 5;
+  int64 occurred_at_ms = 6;
+
+  Authorization authorization = 7;
+  MeterSnapshot meter = 8;
+  StopReason stop_reason = 9;
+  SourceProtocol source = 10;
+
+  // The originating protocol's own transaction identifier, kept for support
+  // and reconciliation against a charge point's local records.
+  string transaction_reference = 11;
+}
+
+enum SessionEventType {
+  SESSION_EVENT_TYPE_UNSPECIFIED = 0;
+  SESSION_EVENT_TYPE_STARTED = 1;
+  SESSION_EVENT_TYPE_UPDATED = 2;
+  SESSION_EVENT_TYPE_STOPPED = 3;
+}
+
+// Authorization identifies who started the session.
+//
+// An RFID card number identifies a person. ORVOLT therefore carries a keyed
+// hash rather than the raw token: support and billing need to recognise the
+// same card again, which a stable hash provides, and neither needs to be able
+// to clone it, which the raw value would allow.
+message Authorization {
+  TokenType token_type = 1;
+  // Keyed hash of the presented token. Never the raw token.
+  string token_hash = 2;
+  // Opaque reference to the authorization decision, for audit.
+  string authorization_reference = 3;
+}
+
+enum TokenType {
+  TOKEN_TYPE_UNSPECIFIED = 0;
+  TOKEN_TYPE_RFID = 1;
+  TOKEN_TYPE_APP = 2;
+  TOKEN_TYPE_PLUG_AND_CHARGE = 3;
+  TOKEN_TYPE_REMOTE = 4;
+  TOKEN_TYPE_LOCAL_FREE = 5;
+}
+
+// MeterSnapshot is a reading of the station's cumulative energy register.
+//
+// Energy delivered is derived from two register readings rather than reported
+// directly, because a register is monotonic and survives a reconnect, while a
+// per-session accumulator does not.
+message MeterSnapshot {
+  int64 energy_register_wh = 1;
+  int64 measured_at_ms = 2;
+}
+
+enum StopReason {
+  STOP_REASON_UNSPECIFIED = 0;
+  STOP_REASON_LOCAL = 1;
+  STOP_REASON_REMOTE = 2;
+  STOP_REASON_EV_DISCONNECTED = 3;
+  STOP_REASON_EMERGENCY_STOP = 4;
+  STOP_REASON_POWER_LOSS = 5;
+  STOP_REASON_DE_AUTHORIZED = 6;
+  STOP_REASON_ENERGY_LIMIT_REACHED = 7;
+  STOP_REASON_TIME_LIMIT_REACHED = 8;
+  STOP_REASON_OTHER = 9;
+}
+
+// SourceProtocol records which adapter produced the event, so that a defect can
+// be traced back to one integration rather than to "the platform".
+enum SourceProtocol {
+  SOURCE_PROTOCOL_UNSPECIFIED = 0;
+  SOURCE_PROTOCOL_EDGE_AGENT = 1;
+  SOURCE_PROTOCOL_OCPP_1_6 = 2;
+  SOURCE_PROTOCOL_OCPP_2_0_1 = 3;
+}

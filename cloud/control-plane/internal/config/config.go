@@ -17,12 +17,21 @@ type Config struct {
 	NATSCAFile       string
 	TelemetrySubject string
 	EnergySubject    string
+	SessionSubject   string
 	DLQSubject       string
 
 	// JetStream retention. A stream without limits eventually fills the
 	// broker's disk and stops accepting publishes, which stops the fleet.
 	StreamMaxAge   time.Duration
 	StreamMaxBytes int64
+
+	// Sessions are billing evidence and outlive telemetry by design.
+	SessionRetention time.Duration
+
+	// RequireDeviceIdentity rejects telemetry that did not arrive on an
+	// authenticated per-device subject. Off for local development, mandatory
+	// for any bus an untrusted network can reach.
+	RequireDeviceIdentity bool
 
 	// Ingest batching. One database transaction per telemetry sample does not
 	// survive fleet scale, so messages are grouped into a bounded window.
@@ -46,10 +55,15 @@ func Load() Config {
 		NATSCAFile:       env("NATS_CA_FILE", ""),
 		TelemetrySubject: env("NATS_SUBJECT", "orvolt.telemetry.evse.v1"),
 		EnergySubject:    env("ENERGY_NATS_SUBJECT", "orvolt.energy.site.v1"),
+		SessionSubject:   env("SESSION_NATS_SUBJECT", "orvolt.session.evse.v1"),
 		DLQSubject:       env("DLQ_SUBJECT_PREFIX", "orvolt.dlq"),
 
 		StreamMaxAge:   envDuration("STREAM_MAX_AGE", 720*time.Hour),
 		StreamMaxBytes: envBytes("STREAM_MAX_BYTES", 8<<30),
+
+		SessionRetention: envDuration("SESSION_STREAM_MAX_AGE", 8760*time.Hour),
+
+		RequireDeviceIdentity: os.Getenv("REQUIRE_DEVICE_IDENTITY") == "true",
 
 		BatchSize:     envInt("INGEST_BATCH_SIZE", 256),
 		BatchInterval: envDuration("INGEST_BATCH_INTERVAL", 250*time.Millisecond),

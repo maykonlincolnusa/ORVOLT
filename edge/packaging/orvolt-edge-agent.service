@@ -1,0 +1,59 @@
+[Unit]
+Description=ORVOLT edge agent
+Documentation=https://github.com/maykonlincolnusa/ORVOLT
+# The agent is an observer. It must never be ordered before, or made a
+# dependency of, anything in the electrical safety path.
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/orvolt-edge-agent
+EnvironmentFile=/etc/orvolt/edge-agent.env
+
+# A charger is unattended and often unreachable. Restarting forever is correct:
+# the alternative is a station that silently stops reporting until a technician
+# is dispatched.
+Restart=always
+RestartSec=5s
+
+# The hardware watchdog catches the case a plain restart policy cannot: a
+# process that is still running but has stopped making progress.
+WatchdogSec=60s
+
+User=orvolt
+Group=orvolt
+
+# The spool is the reason a link outage does not lose readings, so it must
+# survive both restarts and A/B system updates.
+StateDirectory=orvolt
+StateDirectoryMode=0750
+Environment=SPOOL_DIR=/var/lib/orvolt/spool
+
+# The agent reads a broker and writes a spool. Nothing else on the device is
+# its business, and a charger is a target worth compromising.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Bounded so that a spool growing under a long outage cannot push the charger's
+# controller into the out-of-memory killer.
+MemoryMax=192M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
