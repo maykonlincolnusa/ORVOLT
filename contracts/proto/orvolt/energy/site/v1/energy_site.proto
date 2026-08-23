@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package orvolt.energy.site.v1;
+
+option go_package = "github.com/orvolt/orvolt/contracts/gen/go/orvolt/energy/site/v1;sitev1";
+
+// EnergySiteObservation is an immutable, read-only observation from an
+// authorized external energy source. It does not carry a control command.
+message EnergySiteObservation {
+  string site_id = 1;
+  SourceMetadata source = 2;
+  int64 observed_at_ms = 3;
+  int64 retrieved_at_ms = 4;
+
+  optional double solar_generation_kw = 5;
+  optional double site_load_kw = 6;
+  optional double grid_import_kw = 7;
+  optional double grid_export_kw = 8;
+  optional double battery_charge_kw = 9;
+  optional double battery_discharge_kw = 10;
+  optional double battery_soc = 11;
+  optional double tariff_import_per_kwh = 12;
+
+  DataQuality data_quality = 13;
+}
+
+message SourceMetadata {
+  EnergyProvider provider = 1;
+  string provider_site_id = 2;
+  string provider_asset_id = 3;
+  string consent_scope = 4;
+}
+
+enum EnergyProvider {
+  ENERGY_PROVIDER_UNSPECIFIED = 0;
+  SMA = 1;
+  ENPHASE = 2;
+  SOLAREDGE = 3;
+  TESLA_ENERGY = 4;
+  UTILITY = 5;
+  OTHER = 6;
+}
+
+enum DataQuality {
+  DATA_QUALITY_UNSPECIFIED = 0;
+  MEASURED = 1;
+  ESTIMATED = 2;
+  FORECAST = 3;
+  UNAVAILABLE = 4;
+}

@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package orvolt.telemetry.evse.v1;
+
+option go_package = "github.com/orvolt/orvolt/contracts/gen/go/orvolt/telemetry/evse/v1;evsev1";
+
+// ChargingTelemetry is an immutable observation produced locally by an edge agent.
+message ChargingTelemetry {
+  string station_id = 1;
+  string connector_id = 2;
+  int64 timestamp_ms = 3;
+
+  double voltage = 4;
+  double current = 5;
+  double power_kw = 6;
+  double energy_kwh = 7;
+  double soc = 8;
+  double temperature_c = 9;
+
+  ChargingState state = 10;
+  EdgeMetadata edge = 11;
+}
+
+message EdgeMetadata {
+  string edge_id = 1;
+  string site_id = 2;
+  int64 received_at_ms = 3;
+}
+
+enum ChargingState {
+  CHARGING_STATE_UNSPECIFIED = 0;
+  AVAILABLE = 1;
+  PREPARING = 2;
+  CHARGING = 3;
+  FINISHING = 4;
+  FAULTED = 5;
+}

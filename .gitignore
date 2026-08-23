@@ -1,0 +1,7 @@
+.env
+.DS_Store
+build/
+**/build/
+**/target/
+coverage/
+*.log

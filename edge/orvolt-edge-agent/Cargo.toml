@@ -1,0 +1,23 @@
+[package]
+name = "orvolt-edge-agent"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1.0.95"
+async-nats = "0.38.0"
+bytes = "1.9.0"
+clap = { version = "4.5.23", features = ["derive", "env"] }
+prost = "0.13.4"
+rumqttc = "0.24.0"
+serde = { version = "1.0.216", features = ["derive"] }
+serde_json = "1.0.134"
+thiserror = "2.0.6"
+tokio = { version = "1.42.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }
+
+[build-dependencies]
+prost-build = "0.13.4"
+protoc-bin-vendored = "3.1.0"
