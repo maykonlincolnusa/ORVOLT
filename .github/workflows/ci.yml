@@ -112,8 +112,22 @@ jobs:
         run: docker compose up -d --build
       - name: Wait for the control plane to become ready
         run: ./scripts/wait-for-ready.sh http://localhost:8080/ready 180
-      - name: Assert telemetry reaches PostgreSQL
-        run: ./scripts/smoke-test.sh http://localhost:8080 orvolt-sim-001 120
+
+      # Each hop of the chain is asserted separately. A single check at the end
+      # can only report that nothing arrived; these name the hop that broke,
+      # which is the difference between a diagnosis and a bisect.
+      - name: 1. Simulator publishes to the broker
+        run: ./scripts/expect-log.sh evse-simulator '"station_id"' 60
+      - name: 2. Edge agent connected to the broker
+        run: ./scripts/expect-metric.sh http://localhost:9090/metrics orvolt_edge_broker_connected 1 60
+      - name: 3. Edge agent received telemetry
+        run: ./scripts/expect-metric.sh http://localhost:9090/metrics orvolt_edge_telemetry_received_total 1 60
+      - name: 4. Edge agent connected to the event bus
+        run: ./scripts/expect-metric.sh http://localhost:9090/metrics orvolt_edge_bus_connected 1 60
+      - name: 5. Edge agent delivered telemetry to the cloud
+        run: ./scripts/expect-metric.sh http://localhost:9090/metrics orvolt_edge_telemetry_published_total 1 90
+      - name: 6. Control plane persisted and serves it
+        run: ./scripts/smoke-test.sh http://localhost:8080 orvolt-sim-001 90
       - name: Dump logs on failure
         if: failure()
         run: docker compose logs --no-color --tail 200

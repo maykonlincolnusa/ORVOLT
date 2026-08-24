@@ -1,5 +1,8 @@
 FROM rust:1-bookworm AS build
 WORKDIR /src
+# The pinned toolchain travels with the source: a charger binary built by a
+# different compiler than the one CI verified is not the binary CI verified.
+COPY rust-toolchain.toml ./
 COPY contracts ./contracts
 COPY edge/orvolt-edge-agent ./edge/orvolt-edge-agent
 RUN cargo build --manifest-path edge/orvolt-edge-agent/Cargo.toml --release --locked

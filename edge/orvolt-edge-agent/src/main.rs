@@ -14,6 +14,7 @@ use orvolt_edge_agent::subject;
 use orvolt_edge_agent::watchdog;
 use orvolt_edge_agent::{encode, normalize, parse_payload, EdgeContext};
 use rumqttc::{AsyncClient, Event, Incoming, MqttOptions, QoS};
+use tokio::sync::mpsc;
 use tokio::time::{interval, sleep};
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -225,64 +226,160 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    loop {
-        let mut mqtt_options =
-            MqttOptions::new(&config.edge_id, &config.mqtt_host, config.mqtt_port);
-        mqtt_options.set_keep_alive(Duration::from_secs(15));
-        mqtt_options.set_clean_session(false);
-        let (client, mut event_loop) = AsyncClient::new(mqtt_options, 100);
-        client
-            .subscribe(config.mqtt_topic.clone(), QoS::AtLeastOnce)
-            .await
-            .context("subscribing to MQTT telemetry")?;
-        info!(topic = %config.mqtt_topic, "edge agent awaiting MQTT telemetry");
+    // The broker is read on its own task and its payloads arrive over a
+    // channel.
+    //
+    // rumqttc's EventLoop::poll is not cancellation-safe: dropping the future
+    // mid-flight discards connection state and received packets. Selecting on
+    // it alongside a timer means the timer cancels it on every tick, which
+    // silently loses telemetry. A channel receive is cancellation-safe, so the
+    // select below is free to fire as often as it likes.
+    let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(1024);
+    tokio::spawn(read_broker(
+        BrokerConfig {
+            client_id: config.edge_id.clone(),
+            host: config.mqtt_host.clone(),
+            port: config.mqtt_port,
+            topic: config.mqtt_topic.clone(),
+        },
+        sender,
+        Arc::clone(&metrics),
+    ));
 
-        loop {
-            tokio::select! {
-                signal = tokio::signal::ctrl_c() => {
-                    signal.context("waiting for shutdown signal")?;
-                    watchdog::stopping();
-                    info!("edge agent shutting down; flushing spool");
-                    drain(&mut forwarder, &metrics).await;
-                    return Ok(());
+    // Containers are stopped with SIGTERM, not SIGINT. Handling only the latter
+    // would mean the spool is never flushed on an ordinary shutdown.
+    let mut shutdown = shutdown_signals()?;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => {
+                watchdog::stopping();
+                info!("edge agent shutting down; flushing spool");
+                drain(&mut forwarder, &metrics).await;
+                return Ok(());
+            }
+            _ = flush.tick() => {
+                drain(&mut forwarder, &metrics).await;
+                // The keepalive is sent from inside the working loop and only
+                // after a drain attempt completed. A ping emitted by an
+                // independent timer would keep reporting health for a process
+                // that had stopped doing anything.
+                if keepalive.is_some() {
+                    watchdog::alive();
                 }
-                _ = flush.tick() => {
-                    drain(&mut forwarder, &metrics).await;
-                    // The keepalive is sent from inside the working loop and
-                    // only after a drain attempt completed. A ping emitted by
-                    // an independent timer would keep reporting health for a
-                    // process that had stopped doing anything.
-                    if keepalive.is_some() {
-                        watchdog::alive();
-                    }
-                }
-                event = event_loop.poll() => match event {
-                    Ok(Event::Incoming(Incoming::ConnAck(_))) => {
-                        metrics.broker_connected.store(true, Ordering::Relaxed);
-                    }
-                    Ok(Event::Incoming(Incoming::Publish(message))) => {
-                        Metrics::increment(&metrics.received);
-                        if let Some(payload) = accept(&message.payload, &config, &sequence, &metrics) {
-                            // Enqueuing only touches local storage, so a cloud
-                            // outage can never cause a reading to be lost here.
-                            if let Err(error) = forwarder.enqueue(&payload) {
-                                error!(%error, "spooling telemetry failed");
-                            }
+            }
+            payload = receiver.recv() => match payload {
+                Some(raw) => {
+                    Metrics::increment(&metrics.received);
+                    if let Some(encoded) = accept(&raw, &config, &sequence, &metrics) {
+                        // Enqueuing only touches local storage, so a cloud
+                        // outage can never cause a reading to be lost here.
+                        if let Err(error) = forwarder.enqueue(&encoded) {
+                            error!(%error, "spooling telemetry failed");
                         }
                     }
-                    Ok(_) => {}
-                    Err(error) => {
-                        metrics.broker_connected.store(false, Ordering::Relaxed);
-                        error!(%error, "MQTT connection failed; recreating client");
-                        // Keep draining while the broker is down: the two links
-                        // fail independently.
-                        drain(&mut forwarder, &metrics).await;
-                        sleep(Duration::from_secs(2)).await;
-                        break;
+                }
+                None => {
+                    error!("broker reader stopped; flushing spool and exiting");
+                    drain(&mut forwarder, &metrics).await;
+                    return Err(anyhow::anyhow!("MQTT reader terminated"));
+                }
+            },
+        }
+    }
+}
+
+struct BrokerConfig {
+    client_id: String,
+    host: String,
+    port: u16,
+    topic: String,
+}
+
+/// Reads the site broker forever, reconnecting on failure.
+///
+/// This runs uninterrupted on its own task precisely so that nothing can cancel
+/// `poll()` between the broker delivering a packet and the agent recording it.
+async fn read_broker(config: BrokerConfig, sender: mpsc::Sender<Vec<u8>>, metrics: Arc<Metrics>) {
+    loop {
+        let mut options = MqttOptions::new(&config.client_id, &config.host, config.port);
+        options.set_keep_alive(Duration::from_secs(15));
+        // A persistent session lets the broker hold QoS 1 messages for this
+        // agent while it is restarting.
+        options.set_clean_session(false);
+        let (client, mut event_loop) = AsyncClient::new(options, 100);
+
+        if let Err(error) = client
+            .subscribe(config.topic.clone(), QoS::AtLeastOnce)
+            .await
+        {
+            warn!(%error, "subscribing to MQTT telemetry failed; retrying");
+            sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        info!(topic = %config.topic, "edge agent awaiting MQTT telemetry");
+
+        loop {
+            match event_loop.poll().await {
+                Ok(Event::Incoming(Incoming::ConnAck(_))) => {
+                    metrics.broker_connected.store(true, Ordering::Relaxed);
+                }
+                Ok(Event::Incoming(Incoming::Publish(message))) => {
+                    // A full channel blocks this task rather than dropping the
+                    // reading. The broker then holds the backlog, which is
+                    // exactly what a persistent QoS 1 session is for.
+                    if sender.send(message.payload.to_vec()).await.is_err() {
+                        return;
                     }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    metrics.broker_connected.store(false, Ordering::Relaxed);
+                    error!(%error, "MQTT connection failed; recreating client");
+                    sleep(Duration::from_secs(2)).await;
+                    break;
                 }
             }
         }
+    }
+}
+
+/// A stream that yields once for either termination signal.
+struct Shutdown {
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+}
+
+impl Shutdown {
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.terminate.recv() => {}
+                _ = self.interrupt.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+}
+
+fn shutdown_signals() -> anyhow::Result<Shutdown> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        Ok(Shutdown {
+            terminate: signal(SignalKind::terminate()).context("registering SIGTERM handler")?,
+            interrupt: signal(SignalKind::interrupt()).context("registering SIGINT handler")?,
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(Shutdown {})
     }
 }
 
