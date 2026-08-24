@@ -116,7 +116,11 @@ jobs:
       # Each hop of the chain is asserted separately. A single check at the end
       # can only report that nothing arrived; these name the hop that broke,
       # which is the difference between a diagnosis and a bisect.
-      - name: 1. Simulator publishes to the broker
+      - name: 1a. Simulator binary loads its C++ runtime
+        run: ./scripts/expect-no-log.sh evse-simulator 'error while loading shared libraries' 15
+      - name: 1b. Simulator connected to the broker
+        run: ./scripts/expect-log.sh evse-simulator 'simulator connected' 60
+      - name: 1c. Broker delivered telemetry
         run: ./scripts/expect-mqtt.sh 'orvolt/simulators/evse/telemetry' 60
       - name: 2. Edge agent connected to the broker
         run: ./scripts/expect-metric.sh http://localhost:9090/metrics orvolt_edge_broker_connected 1 60

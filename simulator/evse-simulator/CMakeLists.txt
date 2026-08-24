@@ -26,6 +26,17 @@ add_executable(evse-simulator src/main.cpp)
 target_link_libraries(evse-simulator PRIVATE evse_telemetry paho-mqtt3a-static)
 target_compile_options(evse-simulator PRIVATE $<$<CXX_COMPILER_ID:MSVC>:/W4 /wd4201> $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -Wpedantic>)
 
+# Carry the C++ runtime in the binary.
+#
+# The container build compiles with a newer GCC than the runtime image ships a
+# libstdc++ for, so a dynamically linked binary is rejected by the loader before
+# main() runs: "version GLIBCXX_3.4.3x not found". Linking the runtime in
+# removes the coupling between the compiler that built the binary and the
+# distribution that runs it, which is the same property the edge agent gets from
+# a static musl build.
+target_link_options(evse-simulator PRIVATE
+  $<$<CXX_COMPILER_ID:GNU>:-static-libstdc++;-static-libgcc>)
+
 include(CTest)
 if(BUILD_TESTING)
   add_executable(evse-telemetry-test tests/telemetry_test.cpp)
