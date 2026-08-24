@@ -42,11 +42,40 @@ bool wait_for_connection(MQTTAsync client, int timeout_ms) {
   return MQTTAsync_isConnected(client) != 0;
 }
 
+// Keeps trying to reach the broker until it succeeds or the process is asked to
+// stop.
+//
+// A single attempt is not enough. Container orchestration only guarantees that
+// the broker's *container* started, not that it is accepting connections, so a
+// simulator that exits on the first refusal loses a race it should simply wait
+// out.
+bool connect_with_retry(MQTTAsync client, const std::string& broker) {
+  for (int attempt = 1; keep_running; ++attempt) {
+    MQTTAsync_connectOptions options = MQTTAsync_connectOptions_initializer;
+    options.keepAliveInterval = 20;
+    options.cleansession = 1;
+    if (MQTTAsync_connect(client, &options) == MQTTASYNC_SUCCESS &&
+        wait_for_connection(client, 5'000)) {
+      return true;
+    }
+    std::cerr << "attempt " << attempt << ": MQTT broker " << broker
+              << " is not reachable yet; retrying\n";
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+  }
+  return false;
+}
+
 }  // namespace
 
 int main() {
   std::signal(SIGINT, stop);
   std::signal(SIGTERM, stop);
+
+  // Flush every write. Standard output is a pipe when this runs in a container,
+  // so the default block buffering holds roughly 4 KB — about twenty seconds of
+  // telemetry — before anything becomes visible. A process whose logs appear in
+  // delayed chunks cannot be diagnosed while it is misbehaving.
+  std::cout << std::unitbuf;
 
   const std::string broker = std::string{"tcp://"} + env_or("MQTT_HOST", "localhost") + ":" + env_or("MQTT_PORT", "1883");
   const std::string topic = env_or("MQTT_TOPIC", "orvolt/simulators/evse/telemetry");
@@ -59,11 +88,7 @@ int main() {
     return 1;
   }
 
-  MQTTAsync_connectOptions options = MQTTAsync_connectOptions_initializer;
-  options.keepAliveInterval = 20;
-  options.cleansession = 1;
-  if (MQTTAsync_connect(client, &options) != MQTTASYNC_SUCCESS || !wait_for_connection(client, 10'000)) {
-    std::cerr << "failed to connect to MQTT broker " << broker << "\n";
+  if (!connect_with_retry(client, broker)) {
     MQTTAsync_destroy(&client);
     return 1;
   }
@@ -71,6 +96,12 @@ int main() {
   std::cout << "simulator connected to " << broker << " and publishing " << topic << "\n";
   orvolt::simulator::TelemetryGenerator generator{station_id, connector_id};
   while (keep_running) {
+    // A broker restart must not end the simulator: reconnect and carry on, the
+    // way the site-local publisher it stands in for would have to.
+    if (!MQTTAsync_isConnected(client) && !connect_with_retry(client, broker)) {
+      break;
+    }
+
     const auto payload = orvolt::simulator::to_json(generator.next());
     MQTTAsync_message message = MQTTAsync_message_initializer;
     message.payload = const_cast<char*>(payload.data());

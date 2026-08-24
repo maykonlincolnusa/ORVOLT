@@ -117,7 +117,7 @@ jobs:
       # can only report that nothing arrived; these name the hop that broke,
       # which is the difference between a diagnosis and a bisect.
       - name: 1. Simulator publishes to the broker
-        run: ./scripts/expect-log.sh evse-simulator '"station_id"' 60
+        run: ./scripts/expect-mqtt.sh 'orvolt/simulators/evse/telemetry' 60
       - name: 2. Edge agent connected to the broker
         run: ./scripts/expect-metric.sh http://localhost:9090/metrics orvolt_edge_broker_connected 1 60
       - name: 3. Edge agent received telemetry
