@@ -35,7 +35,10 @@ jobs:
           - target: x86_64-unknown-linux-musl
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # rust-toolchain.toml pins the compiler. A charger binary built by a
+      # different compiler than CI verified is not the binary CI verified.
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: edge/orvolt-edge-agent

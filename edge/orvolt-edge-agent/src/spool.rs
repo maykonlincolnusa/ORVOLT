@@ -156,19 +156,15 @@ impl Spool {
             return Ok((records, cursor));
         }
 
-        loop {
-            let Some(segment) = self.segment_at_or_after(cursor.segment) else {
-                break;
-            };
+        while let Some(segment) = self.segment_at_or_after(cursor.segment) {
             if segment != cursor.segment {
                 cursor = Cursor { segment, offset: 0 };
             }
 
             let exhausted = self.read_from_segment(segment, &mut cursor, max, &mut records)?;
-            if records.len() >= max {
-                break;
-            }
-            if !exhausted {
+            // Stop once the caller has what it asked for, or once this segment
+            // ended for a reason other than running out of records.
+            if records.len() >= max || !exhausted {
                 break;
             }
             match self.segment_after(segment) {

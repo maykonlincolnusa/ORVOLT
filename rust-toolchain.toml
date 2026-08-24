@@ -1,0 +1,14 @@
+# Pinned so that a compiler release cannot break the build without a change to
+# this repository.
+#
+# CI previously installed whatever "stable" meant on the day it ran. Rust 1.98
+# added a clippy lint that the edge agent tripped, and the build broke with no
+# commit behind it. Dependencies are locked by Cargo.lock and `--locked`; the
+# toolchain that compiles them deserves the same treatment.
+#
+# rustup installs this automatically for anyone building in this directory.
+# Raising the version is a deliberate change, made when someone can fix whatever
+# new lints arrive with it.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]

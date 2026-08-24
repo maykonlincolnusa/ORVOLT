@@ -23,6 +23,9 @@ jobs:
           fetch-depth: 0
       - uses: bufbuild/buf-setup-action@v1
         with:
+          # Pinned: lint rules are part of the build contract, and a new buf
+          # release changing them would break CI with no commit behind it.
+          version: 1.47.2
           github_token: ${{ github.token }}
       - name: Lint
         run: buf lint
@@ -39,6 +42,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: bufbuild/buf-setup-action@v1
         with:
+          # Pinned: lint rules are part of the build contract, and a new buf
+          # release changing them would break CI with no commit behind it.
+          version: 1.47.2
           github_token: ${{ github.token }}
       - uses: actions/setup-go@v5
         with:
@@ -68,9 +74,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+      # No toolchain action: rust-toolchain.toml is the single source of truth,
+      # and rustup installs what it pins. Installing "stable" here would mean a
+      # compiler release could break the build with no commit behind it, which
+      # is exactly what happened when Rust 1.98 added a new clippy lint.
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: edge/orvolt-edge-agent
