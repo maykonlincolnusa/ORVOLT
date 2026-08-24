@@ -13,3 +13,7 @@ contracts/gen/go/
 # Local edge spool written at runtime by the edge agent.
 spool/
 *.spool
+
+# Editor state. The CMake extension writes machine-specific absolute paths here.
+.vscode/
+.idea/
